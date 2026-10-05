@@ -24,6 +24,46 @@ What runs where:
 
 ---
 
+## Quick start: one command on the Proxmox host
+
+`deploy/proxmox-deploy.sh` does steps 2–6 below for you. It creates the
+container, bind-mounts and maps the CSV directory, installs PostgreSQL and
+Ledger, creates the database and an admin user, starts everything and checks
+health. Copy a release tarball to the Proxmox host (see step 1) and run:
+
+```sh
+tar xzf ledger-<version>-linux-amd64.tar.gz && cd ledger-<version>-linux-amd64
+./deploy/proxmox-deploy.sh --csv-path /mnt/pve/truenas/ledger
+```
+
+It shows the plan, asks for confirmation, and at the end prints the URL and a
+generated admin password (shown once; change it under **Settings**).
+
+Common options (run `--help` for all of them):
+
+```sh
+./deploy/proxmox-deploy.sh --csv-path /mnt/pve/truenas/ledger \
+  --ctid 120 --hostname ledger \
+  --ip 192.168.1.50/24 --gateway 192.168.1.1 [--vlan 20] \
+  --memory 512 --disk 4 --storage local-lvm \
+  --admin-user alice --admin-password-file /root/pw.txt \
+  --ssh-keys /root/.ssh/authorized_keys \
+  --no-chown           # if TrueNAS maps ownership itself (NFS Mapall)
+  --dry-run            # print the commands without running them
+```
+
+Upgrade an existing container to a new release. It backs up the database
+first and keeps the configuration and port:
+
+```sh
+./deploy/proxmox-deploy.sh --upgrade --ctid 120 --release ledger-<new>-linux-amd64.tar.gz
+```
+
+The rest of this guide explains each step, for manual installs and
+troubleshooting.
+
+---
+
 ## 1. Build a release (on your workstation)
 
 Requires Go 1.25+ and Node.js 22.

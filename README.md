@@ -85,8 +85,14 @@ Optional columns: `reference`, `memo`, `currency`. Full rules are in
 
 ## Running
 
-**Production:** see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) (Proxmox LXC,
-TrueNAS bind mount, systemd, backups, HTTPS).
+**Production (Proxmox):** `make release`, copy the tarball to the Proxmox host, then
+
+```sh
+./deploy/proxmox-deploy.sh --csv-path /mnt/pve/truenas/ledger
+```
+
+This creates the LXC container and installs everything. Details, manual steps,
+HTTPS, backups and upgrades are in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 **Locally:**
 
