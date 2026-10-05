@@ -75,6 +75,40 @@ CREATE TABLE accounts (
 );
 
 -- -----------------------------------------------------------------------------
+-- users: people who can log in. Users are never deleted (journal entries
+-- reference who posted them); disable them instead.
+-- -----------------------------------------------------------------------------
+CREATE TABLE users (
+    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    username      TEXT        NOT NULL,
+    password_hash TEXT        NOT NULL,
+    is_active     BOOLEAN     NOT NULL DEFAULT TRUE,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_login_at TIMESTAMPTZ,
+
+    CONSTRAINT users_username_unique UNIQUE (username),
+    CONSTRAINT users_username_format CHECK (username ~ '^[a-z0-9][a-z0-9._-]{0,63}$'),
+    CONSTRAINT users_password_hash_nonempty CHECK (length(password_hash) > 0)
+);
+
+-- -----------------------------------------------------------------------------
+-- sessions: server-side login sessions. Only a SHA-256 hash of the session
+-- token is stored, so a database leak does not expose usable cookies.
+-- -----------------------------------------------------------------------------
+CREATE TABLE sessions (
+    token_hash   BYTEA       PRIMARY KEY,
+    user_id      BIGINT      NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at   TIMESTAMPTZ NOT NULL,
+
+    CONSTRAINT sessions_token_hash_length CHECK (length(token_hash) = 32)
+);
+
+CREATE INDEX sessions_user_idx    ON sessions (user_id);
+CREATE INDEX sessions_expires_idx ON sessions (expires_at);
+
+-- -----------------------------------------------------------------------------
 -- csv_imports: one row per imported CSV file. The SHA-256 of the file content
 -- is unique, so the same file can never be imported twice.
 -- -----------------------------------------------------------------------------
@@ -84,6 +118,7 @@ CREATE TABLE csv_imports (
     sha256      CHAR(64)    NOT NULL,
     entry_count INTEGER     NOT NULL,
     line_count  INTEGER     NOT NULL,
+    imported_by BIGINT      REFERENCES users (id) ON DELETE RESTRICT,
     imported_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CONSTRAINT csv_imports_sha256_unique UNIQUE (sha256),
@@ -104,6 +139,9 @@ CREATE TABLE journal_entries (
     reverses_id  BIGINT      REFERENCES journal_entries (id) ON DELETE RESTRICT,
     -- Set when the entry was created by a CSV import.
     import_id    BIGINT      REFERENCES csv_imports (id) ON DELETE RESTRICT,
+    -- Who posted the entry (audit trail). NULL only for rows written directly
+    -- in SQL by an administrator.
+    created_by   BIGINT      REFERENCES users (id) ON DELETE RESTRICT,
     posted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- ID of the database transaction that created this row. Always overwritten
     -- by trigger; used to stop lines being appended to an already-posted entry.
@@ -353,6 +391,15 @@ CREATE TRIGGER csv_imports_no_truncate
     BEFORE TRUNCATE ON csv_imports
     FOR EACH STATEMENT EXECUTE FUNCTION trg_reject_modification();
 
+-- Users are referenced by the audit trail: disable, never delete.
+CREATE TRIGGER users_no_delete
+    BEFORE DELETE ON users
+    FOR EACH ROW EXECUTE FUNCTION trg_reject_modification();
+
+CREATE TRIGGER users_no_truncate
+    BEFORE TRUNCATE ON users
+    FOR EACH STATEMENT EXECUTE FUNCTION trg_reject_modification();
+
 CREATE TRIGGER currencies_no_truncate
     BEFORE TRUNCATE ON currencies
     FOR EACH STATEMENT EXECUTE FUNCTION trg_reject_modification();
@@ -362,17 +409,11 @@ CREATE TRIGGER accounts_no_truncate
     FOR EACH STATEMENT EXECUTE FUNCTION trg_reject_modification();
 
 -- =============================================================================
--- Recommended privileges (defence in depth)
+-- Privileges
 --
--- Run the application as a role that does not own these tables, so it cannot
--- DROP or DISABLE the triggers above. Example (adjust the role name):
---
---   CREATE ROLE ledger_app LOGIN PASSWORD '...';
---   GRANT USAGE ON SCHEMA public TO ledger_app;
---   GRANT SELECT, INSERT, UPDATE ON accounts TO ledger_app;
---   GRANT SELECT ON currencies TO ledger_app;
---   GRANT SELECT, INSERT ON journal_entries, transactions, csv_imports TO ledger_app;
---   REVOKE UPDATE, DELETE, TRUNCATE ON journal_entries, transactions, csv_imports FROM ledger_app;
+-- Run the application as a role that does NOT own these tables, so it cannot
+-- DROP, ALTER or DISABLE the triggers above. deploy/setup-db.sh creates an
+-- owner role and an application role and applies db/grants.sql.
 -- =============================================================================
 
 COMMIT;

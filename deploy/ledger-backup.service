@@ -1,0 +1,20 @@
+# /etc/systemd/system/ledger-backup.service — run by ledger-backup.timer
+[Unit]
+Description=Ledger database backup to /app/csv_data/backups
+After=postgresql.service
+RequiresMountsFor=/app/csv_data
+
+[Service]
+Type=oneshot
+User=ledger
+Group=ledger
+EnvironmentFile=/etc/ledger/ledger.env
+ExecStart=/usr/local/bin/ledger-backup
+UMask=0027
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/app/csv_data
+ProtectHome=yes
+PrivateTmp=yes

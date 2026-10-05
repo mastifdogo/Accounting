@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Ledger API
-  version: 0.2.0
+  version: 0.4.0
   description: |
     API for a lightweight double-entry accounting ledger.
 
@@ -15,7 +15,8 @@ info:
     currency. A journal entry must balance **within each currency**. Amounts
     in different currencies are never added together: reports give totals per
     currency. To move value between currencies, post through an FX clearing
-    account in each currency, e.g. buying USD 1,000.00 for CAD 1,370.00:
+    account in each currency (type `equity`, e.g. "Currency trading"), e.g.
+    buying USD 1,000.00 for CAD 1,370.00:
 
     | account               | debit    | credit   |
     |-----------------------|----------|----------|
@@ -40,11 +41,31 @@ info:
 
     ## CSV files
     Exports and imports live in the server's CSV directory (`/app/csv_data`).
-    Files are UTF-8 encoded, comma separated, with a header row and no BOM.
+    Exports are UTF-8 encoded, comma separated, with a header row and no BOM.
+    Files can be added by uploading them (`POST /files`) or by copying them
+    to the share directly.
+
+    ## Authentication
+    Log in with `POST /auth/login`; the server sets an HttpOnly, SameSite=Strict
+    session cookie (`ledger_session`). Every endpoint except `/health`,
+    `/auth/login` and `/auth/logout` requires it and answers 401 without it.
+    Sessions end after 8 hours of inactivity or 7 days. Users are managed on
+    the server with `ledger user add|passwd|disable|enable|list`; there is no
+    self-registration. Repeated failed logins for the same username and client
+    are refused with 429 for 15 minutes.
+
+    ## Requests
+    JSON request bodies must be sent with `Content-Type: application/json`
+    (otherwise 415). Cross-site state-changing requests from browsers are
+    rejected with 403, so other web pages cannot act on the ledger.
 servers:
   - url: /api/v1
 
+security:
+  - sessionCookie: []
+
 tags:
+  - name: Auth
   - name: System
   - name: Accounts
   - name: Journal Entries
@@ -52,10 +73,75 @@ tags:
   - name: Files
 
 paths:
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Log in and receive a session cookie
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: Logged in; `Set-Cookie` carries the session
+          headers:
+            Set-Cookie:
+              schema: { type: string, example: 'ledger_session=...; Path=/; HttpOnly; SameSite=Strict' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: End the current session
+      security: []
+      responses:
+        '204': { description: Logged out (cookie cleared) }
+        default: { $ref: '#/components/responses/Error' }
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      operationId: getCurrentUser
+      summary: The logged-in user
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+
+  /auth/password:
+    post:
+      tags: [Auth]
+      operationId: changePassword
+      summary: Change your own password (ends your other sessions)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PasswordChange' }
+      responses:
+        '204': { description: Password changed }
+        '401': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+
   /health:
     get:
       tags: [System]
       operationId: getHealth
+      security: []
       summary: Liveness and database connectivity check
       responses:
         '200':
@@ -304,6 +390,58 @@ paths:
               schema: { $ref: '#/components/schemas/TrialBalance' }
         default: { $ref: '#/components/responses/Error' }
 
+  /reports/balance-sheet:
+    get:
+      tags: [Reports]
+      operationId: getBalanceSheet
+      summary: Assets, liabilities and equity as of a date, per currency
+      description: |
+        Amounts use each account's natural sign. Revenue minus expenses to
+        date (not yet closed to an equity account) is reported as
+        `net_income_cents` and included in total equity, so
+        assets = liabilities + equity.
+      parameters:
+        - name: as_of
+          in: query
+          description: Include entries dated on or before this day (default today)
+          schema: { type: string, format: date }
+        - name: currency
+          in: query
+          schema: { $ref: '#/components/schemas/Currency' }
+      responses:
+        '200':
+          description: Balance sheet
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BalanceSheet' }
+        default: { $ref: '#/components/responses/Error' }
+
+  /reports/income-statement:
+    get:
+      tags: [Reports]
+      operationId: getIncomeStatement
+      summary: Revenue, expenses and net income for a period, per currency
+      parameters:
+        - name: from
+          in: query
+          description: Inclusive start date (default January 1 of the `to` year)
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          description: Inclusive end date (default today)
+          schema: { type: string, format: date }
+        - name: currency
+          in: query
+          schema: { $ref: '#/components/schemas/Currency' }
+      responses:
+        '200':
+          description: Income statement
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IncomeStatement' }
+        '422': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+
   /exports/general-ledger:
     post:
       tags: [Files]
@@ -346,6 +484,37 @@ paths:
                   data:
                     type: array
                     items: { $ref: '#/components/schemas/CsvFile' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [Files]
+      operationId: uploadCsvFile
+      summary: Upload a CSV file into the CSV directory
+      description: |
+        The file is stored under its own name, which must match the
+        `CsvFilename` pattern. Existing files are never overwritten (409).
+        Max 10 MiB; content must be UTF-8 text (a leading BOM is allowed).
+        Uploading does not import anything: call `POST /imports/journal-entries`
+        afterwards.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        '201':
+          description: File stored
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CsvFile' }
+        '409': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
         default: { $ref: '#/components/responses/Error' }
 
   /files/{filename}:
@@ -414,6 +583,12 @@ paths:
         default: { $ref: '#/components/responses/Error' }
 
 components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: ledger_session
+
   parameters:
     AccountCode:
       name: accountCode
@@ -496,6 +671,82 @@ components:
       type: string
       pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.csv$'
 
+    User:
+      type: object
+      required: [username, is_active, created_at, last_login_at]
+      properties:
+        username: { type: string, example: alice }
+        is_active: { type: boolean }
+        created_at: { type: string, format: date-time }
+        last_login_at: { type: string, format: date-time, nullable: true }
+    LoginRequest:
+      type: object
+      required: [username, password]
+      additionalProperties: false
+      properties:
+        username: { type: string, description: Case-insensitive }
+        password: { type: string, format: password }
+    PasswordChange:
+      type: object
+      required: [current_password, new_password]
+      additionalProperties: false
+      properties:
+        current_password: { type: string, format: password }
+        new_password: { type: string, format: password, minLength: 10, description: '10+ characters, at most 72 bytes' }
+
+    ReportLine:
+      type: object
+      required: [account_code, account_name, amount_cents]
+      properties:
+        account_code: { $ref: '#/components/schemas/AccountCode' }
+        account_name: { type: string }
+        amount_cents:
+          allOf: [{ $ref: '#/components/schemas/SignedCents' }]
+          description: Natural-sign balance (a contra balance is negative)
+    BalanceSheet:
+      type: object
+      required: [as_of, currencies]
+      properties:
+        as_of: { type: string, format: date }
+        currencies:
+          type: array
+          items:
+            type: object
+            required: [currency, assets, liabilities, equity, net_income_cents, total_assets_cents,
+                       total_liabilities_cents, total_equity_cents, balanced]
+            properties:
+              currency: { $ref: '#/components/schemas/Currency' }
+              assets: { type: array, items: { $ref: '#/components/schemas/ReportLine' } }
+              liabilities: { type: array, items: { $ref: '#/components/schemas/ReportLine' } }
+              equity: { type: array, items: { $ref: '#/components/schemas/ReportLine' } }
+              net_income_cents:
+                allOf: [{ $ref: '#/components/schemas/SignedCents' }]
+                description: Revenue minus expenses to date, not yet closed to equity
+              total_assets_cents: { $ref: '#/components/schemas/SignedCents' }
+              total_liabilities_cents: { $ref: '#/components/schemas/SignedCents' }
+              total_equity_cents:
+                allOf: [{ $ref: '#/components/schemas/SignedCents' }]
+                description: Equity accounts plus net income
+              balanced: { type: boolean, description: assets = liabilities + equity }
+    IncomeStatement:
+      type: object
+      required: [from, to, currencies]
+      properties:
+        from: { type: string, format: date }
+        to: { type: string, format: date }
+        currencies:
+          type: array
+          items:
+            type: object
+            required: [currency, revenue, expenses, total_revenue_cents, total_expenses_cents, net_income_cents]
+            properties:
+              currency: { $ref: '#/components/schemas/Currency' }
+              revenue: { type: array, items: { $ref: '#/components/schemas/ReportLine' } }
+              expenses: { type: array, items: { $ref: '#/components/schemas/ReportLine' } }
+              total_revenue_cents: { $ref: '#/components/schemas/SignedCents' }
+              total_expenses_cents: { $ref: '#/components/schemas/SignedCents' }
+              net_income_cents: { $ref: '#/components/schemas/SignedCents' }
+
     Health:
       type: object
       required: [status, database]
@@ -519,6 +770,10 @@ components:
                 - validation_failed
                 - not_found
                 - conflict
+                - unauthorized
+                - forbidden
+                - payload_too_large
+                - too_many_requests
                 - internal_error
             message: { type: string }
             details:
@@ -608,7 +863,7 @@ components:
         memo: { type: string }
     JournalEntry:
       type: object
-      required: [id, entry_date, description, reference, reverses_id, reversed_by_id, import_id, posted_at, totals, lines]
+      required: [id, entry_date, description, reference, reverses_id, reversed_by_id, import_id, created_by, posted_at, totals, lines]
       properties:
         id: { type: integer, format: int64 }
         entry_date: { type: string, format: date }
@@ -629,6 +884,10 @@ components:
           format: int64
           nullable: true
           description: Set when the entry was created by a CSV import
+        created_by:
+          type: string
+          nullable: true
+          description: Username of the person who posted the entry
         posted_at: { type: string, format: date-time }
         totals:
           type: array

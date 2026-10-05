@@ -1,0 +1,52 @@
+# /etc/systemd/system/ledger.service
+[Unit]
+Description=Ledger double-entry accounting
+Documentation=https://github.com/mastifdogo/Accounting/blob/main/docs/DEPLOYMENT.md
+Wants=network-online.target
+After=network-online.target postgresql.service
+RequiresMountsFor=/app/csv_data
+
+[Service]
+Type=simple
+User=ledger
+Group=ledger
+EnvironmentFile=/etc/ledger/ledger.env
+ExecStart=/usr/local/bin/ledger
+Restart=on-failure
+RestartSec=5
+UMask=0027
+
+# Resource limits for a small container.
+MemoryMax=256M
+TasksMax=64
+
+# Sandboxing. The service only needs the network, the database and the CSV
+# directory. In an unprivileged Proxmox container these need `nesting=1`
+# (the default for new containers); see docs/DEPLOYMENT.md if the service
+# fails with status 226/NAMESPACE.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/app/csv_data
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

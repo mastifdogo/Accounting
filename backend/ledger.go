@@ -321,10 +321,10 @@ func insertJournalEntry(ctx context.Context, tx pgx.Tx, in JournalEntryCreate, a
 	reversesID, importID *int64) (int64, error) {
 	var id int64
 	err := tx.QueryRow(ctx, `
-		INSERT INTO journal_entries (entry_date, description, reference, reverses_id, import_id)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO journal_entries (entry_date, description, reference, reverses_id, import_id, created_by)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING id`,
-		in.EntryDate, strings.TrimSpace(in.Description), strings.TrimSpace(in.Reference), reversesID, importID,
+		in.EntryDate, strings.TrimSpace(in.Description), strings.TrimSpace(in.Reference), reversesID, importID, actorID(ctx),
 	).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("insert journal entry: %w", err)
@@ -433,13 +433,14 @@ func (a *App) ReverseJournalEntry(ctx context.Context, id int64, req ReverseRequ
 
 const entrySelect = `
 	SELECT e.id, e.entry_date, e.description, e.reference, e.reverses_id,
-	       r.id AS reversed_by_id, e.import_id, e.posted_at
+	       r.id AS reversed_by_id, e.import_id, u.username, e.posted_at
 	  FROM journal_entries e
-	  LEFT JOIN journal_entries r ON r.reverses_id = e.id`
+	  LEFT JOIN journal_entries r ON r.reverses_id = e.id
+	  LEFT JOIN users u ON u.id = e.created_by`
 
 func scanEntry(row pgx.Row) (*JournalEntry, error) {
 	var e JournalEntry
-	err := row.Scan(&e.ID, &e.EntryDate, &e.Description, &e.Reference, &e.ReversesID, &e.ReversedByID, &e.ImportID, &e.PostedAt)
+	err := row.Scan(&e.ID, &e.EntryDate, &e.Description, &e.Reference, &e.ReversesID, &e.ReversedByID, &e.ImportID, &e.CreatedBy, &e.PostedAt)
 	if err != nil {
 		return nil, err
 	}
