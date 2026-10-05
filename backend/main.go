@@ -166,6 +166,10 @@ type App struct {
 // All money is int64 cents. Debits and credits are separate non-negative
 // fields at the API boundary; in the database a line is one signed amount
 // (debit > 0, credit < 0).
+//
+// Accounts are identified by their code in the API; database ids stay
+// internal. Every account has one currency and a journal entry must balance
+// within each currency.
 // ---------------------------------------------------------------------------
 
 // MaxCents is the largest amount accepted at the API boundary (2^53 - 1), so
@@ -190,11 +194,27 @@ func (t AccountType) Valid() bool {
 	return false
 }
 
+type Currency string
+
+const (
+	CurrencyCAD Currency = "CAD"
+	CurrencyUSD Currency = "USD"
+)
+
+func (c Currency) Valid() bool { return c == CurrencyCAD || c == CurrencyUSD }
+
+type CurrencyInfo struct {
+	Code       Currency `json:"code"`
+	Name       string   `json:"name"`
+	MinorUnits int      `json:"minor_units"`
+}
+
 type Account struct {
-	ID           int64       `json:"id"`
+	ID           int64       `json:"-"`
 	Code         string      `json:"code"`
 	Name         string      `json:"name"`
 	Type         AccountType `json:"type"`
+	Currency     Currency    `json:"currency"`
 	Description  string      `json:"description"`
 	IsActive     bool        `json:"is_active"`
 	BalanceCents int64       `json:"balance_cents"`
@@ -206,6 +226,7 @@ type AccountCreate struct {
 	Code        string      `json:"code"`
 	Name        string      `json:"name"`
 	Type        AccountType `json:"type"`
+	Currency    Currency    `json:"currency"`
 	Description string      `json:"description"`
 }
 
@@ -216,7 +237,7 @@ type AccountUpdate struct {
 }
 
 type JournalLineCreate struct {
-	AccountID   int64  `json:"account_id"`
+	AccountCode string `json:"account_code"`
 	DebitCents  int64  `json:"debit_cents"`
 	CreditCents int64  `json:"credit_cents"`
 	Memo        string `json:"memo"`
@@ -230,26 +251,33 @@ type JournalEntryCreate struct {
 }
 
 type JournalLine struct {
-	ID          int64  `json:"id"`
-	LineNumber  int    `json:"line_number"`
-	AccountID   int64  `json:"account_id"`
-	AccountCode string `json:"account_code"`
-	AccountName string `json:"account_name"`
-	DebitCents  int64  `json:"debit_cents"`
-	CreditCents int64  `json:"credit_cents"`
-	Memo        string `json:"memo"`
+	ID          int64    `json:"id"`
+	LineNumber  int      `json:"line_number"`
+	AccountCode string   `json:"account_code"`
+	AccountName string   `json:"account_name"`
+	Currency    Currency `json:"currency"`
+	DebitCents  int64    `json:"debit_cents"`
+	CreditCents int64    `json:"credit_cents"`
+	Memo        string   `json:"memo"`
+}
+
+// CurrencyTotal is the total debits (= total credits) of an entry in one currency.
+type CurrencyTotal struct {
+	Currency    Currency `json:"currency"`
+	AmountCents int64    `json:"amount_cents"`
 }
 
 type JournalEntry struct {
-	ID           int64         `json:"id"`
-	EntryDate    Date          `json:"entry_date"`
-	Description  string        `json:"description"`
-	Reference    string        `json:"reference"`
-	ReversesID   *int64        `json:"reverses_id"`
-	ReversedByID *int64        `json:"reversed_by_id"`
-	PostedAt     time.Time     `json:"posted_at"`
-	TotalCents   int64         `json:"total_cents"`
-	Lines        []JournalLine `json:"lines"`
+	ID           int64           `json:"id"`
+	EntryDate    Date            `json:"entry_date"`
+	Description  string          `json:"description"`
+	Reference    string          `json:"reference"`
+	ReversesID   *int64          `json:"reverses_id"`
+	ReversedByID *int64          `json:"reversed_by_id"`
+	ImportID     *int64          `json:"import_id"`
+	PostedAt     time.Time       `json:"posted_at"`
+	Totals       []CurrencyTotal `json:"totals"`
+	Lines        []JournalLine   `json:"lines"`
 }
 
 type ReverseRequest struct {
@@ -277,24 +305,44 @@ type AccountLedger struct {
 }
 
 type TrialBalanceRow struct {
-	AccountID   int64       `json:"account_id"`
 	AccountCode string      `json:"account_code"`
 	AccountName string      `json:"account_name"`
 	AccountType AccountType `json:"account_type"`
+	Currency    Currency    `json:"currency"`
 	DebitCents  int64       `json:"debit_cents"`
 	CreditCents int64       `json:"credit_cents"`
 }
 
+// TrialBalanceTotal holds the column totals for one currency; debits always
+// equal credits.
+type TrialBalanceTotal struct {
+	Currency    Currency `json:"currency"`
+	DebitCents  int64    `json:"debit_cents"`
+	CreditCents int64    `json:"credit_cents"`
+}
+
 type TrialBalance struct {
-	AsOf             Date              `json:"as_of"`
-	Rows             []TrialBalanceRow `json:"rows"`
-	TotalDebitCents  int64             `json:"total_debit_cents"`
-	TotalCreditCents int64             `json:"total_credit_cents"`
+	AsOf   Date                `json:"as_of"`
+	Rows   []TrialBalanceRow   `json:"rows"`
+	Totals []TrialBalanceTotal `json:"totals"`
 }
 
 type ExportRequest struct {
-	From *Date `json:"from,omitempty"`
-	To   *Date `json:"to,omitempty"`
+	From     *Date     `json:"from,omitempty"`
+	To       *Date     `json:"to,omitempty"`
+	Currency *Currency `json:"currency,omitempty"`
+}
+
+type ImportRequest struct {
+	Filename string `json:"filename"`
+}
+
+type ImportResult struct {
+	ImportID        int64  `json:"import_id"`
+	Filename        string `json:"filename"`
+	SHA256          string `json:"sha256"`
+	EntriesImported int    `json:"entries_imported"`
+	LinesImported   int    `json:"lines_imported"`
 }
 
 type CsvFile struct {

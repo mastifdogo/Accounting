@@ -30,12 +30,13 @@ func (a *App) Routes() http.Handler {
 		r.Use(middleware.Timeout(60 * time.Second))
 
 		r.Get("/health", a.handleHealth)
+		r.Get("/currencies", a.handleListCurrencies)
 
 		r.Get("/accounts", a.handleListAccounts)
 		r.Post("/accounts", a.handleCreateAccount)
-		r.Get("/accounts/{accountId}", a.handleGetAccount)
-		r.Patch("/accounts/{accountId}", a.handleUpdateAccount)
-		r.Get("/accounts/{accountId}/ledger", a.handleAccountLedger)
+		r.Get("/accounts/{accountCode}", a.handleGetAccount)
+		r.Patch("/accounts/{accountCode}", a.handleUpdateAccount)
+		r.Get("/accounts/{accountCode}/ledger", a.handleAccountLedger)
 
 		r.Get("/journal-entries", a.handleListJournalEntries)
 		r.Post("/journal-entries", a.handleCreateJournalEntry)
@@ -87,6 +88,15 @@ func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, Health{Status: "ok", Database: "ok"})
 }
 
+func (a *App) handleListCurrencies(w http.ResponseWriter, r *http.Request) {
+	cs, err := a.ListCurrencies(r.Context())
+	if err != nil {
+		writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": cs})
+}
+
 func (a *App) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 	includeInactive, err := queryBool(r, "include_inactive")
 	if err != nil {
@@ -115,11 +125,7 @@ func (a *App) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleGetAccount(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r, "accountId")
-	if !ok {
-		return
-	}
-	acc, err := a.GetAccount(r.Context(), id)
+	acc, err := a.GetAccount(r.Context(), chi.URLParam(r, "accountCode"))
 	if err != nil {
 		writeErr(w, r, err)
 		return
@@ -128,15 +134,11 @@ func (a *App) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r, "accountId")
-	if !ok {
-		return
-	}
 	var in AccountUpdate
 	if !decodeJSON(w, r, &in, true) {
 		return
 	}
-	acc, err := a.UpdateAccount(r.Context(), id, in)
+	acc, err := a.UpdateAccount(r.Context(), chi.URLParam(r, "accountCode"), in)
 	if err != nil {
 		writeErr(w, r, err)
 		return
@@ -145,16 +147,12 @@ func (a *App) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleAccountLedger(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r, "accountId")
-	if !ok {
-		return
-	}
 	from, to, err := queryDateRange(r)
 	if err != nil {
 		writeErr(w, r, err)
 		return
 	}
-	led, err := a.GetAccountLedger(r.Context(), id, from, to)
+	led, err := a.GetAccountLedger(r.Context(), chi.URLParam(r, "accountCode"), from, to)
 	if err != nil {
 		writeErr(w, r, err)
 		return
@@ -171,11 +169,11 @@ func (a *App) handleListJournalEntries(w http.ResponseWriter, r *http.Request) {
 	f := EntryFilter{From: from, To: to, Limit: 50}
 	v := &ValidationError{}
 	q := r.URL.Query()
-	if s := q.Get("account_id"); s != "" {
-		if id, err := strconv.ParseInt(s, 10, 64); err != nil || id < 1 {
-			v.add("account_id", "must be a positive integer")
+	if s := q.Get("account_code"); s != "" {
+		if !accountCodeRe.MatchString(s) {
+			v.add("account_code", "is not a valid account code")
 		} else {
-			f.AccountID = &id
+			f.AccountCode = &s
 		}
 	}
 	if s := q.Get("limit"); s != "" {
@@ -254,7 +252,12 @@ func (a *App) handleTrialBalance(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, r, err)
 		return
 	}
-	tb, err := a.GetTrialBalance(r.Context(), asOf)
+	currency, err := queryCurrency(r)
+	if err != nil {
+		writeErr(w, r, err)
+		return
+	}
+	tb, err := a.GetTrialBalance(r.Context(), asOf, currency)
 	if err != nil {
 		writeErr(w, r, err)
 		return
@@ -267,7 +270,7 @@ func (a *App) handleExportGeneralLedger(w http.ResponseWriter, r *http.Request) 
 	if !decodeJSON(w, r, &req, false) {
 		return
 	}
-	f, err := a.ExportGeneralLedger(r.Context(), req.From, req.To)
+	f, err := a.ExportGeneralLedger(r.Context(), req.From, req.To, req.Currency)
 	if err != nil {
 		writeErr(w, r, err)
 		return
@@ -299,7 +302,22 @@ func (a *App) handleDownloadFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleImportJournalEntries(w http.ResponseWriter, r *http.Request) {
-	writeError(w, http.StatusNotImplemented, "not_implemented", "CSV import is planned for Step 2", nil)
+	var req ImportRequest
+	if !decodeJSON(w, r, &req, true) {
+		return
+	}
+	if !csvFilenameRe.MatchString(req.Filename) {
+		v := &ValidationError{}
+		v.add("filename", "must be a .csv file name in the CSV directory")
+		writeErr(w, r, v)
+		return
+	}
+	res, err := a.ImportJournalEntries(r.Context(), req.Filename)
+	if err != nil {
+		writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, res)
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +387,20 @@ func queryDate(r *http.Request, name string) (*Date, error) {
 		return nil, v
 	}
 	return &d, nil
+}
+
+func queryCurrency(r *http.Request) (*Currency, error) {
+	s := r.URL.Query().Get("currency")
+	if s == "" {
+		return nil, nil
+	}
+	c := Currency(strings.ToUpper(s))
+	if !c.Valid() {
+		v := &ValidationError{}
+		v.add("currency", "must be CAD or USD")
+		return nil, v
+	}
+	return &c, nil
 }
 
 func queryDateRange(r *http.Request) (from, to *Date, err error) {
@@ -444,6 +476,8 @@ func uniqueMessage(pg *pgconn.PgError) string {
 		return "an account with this code already exists"
 	case "journal_entries_reversed_once":
 		return "this journal entry has already been reversed"
+	case "csv_imports_sha256_unique":
+		return "this file's content has already been imported"
 	}
 	return pg.Message
 }

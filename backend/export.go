@@ -24,7 +24,7 @@ var csvFilenameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.csv$`
 
 // generalLedgerHeader is the column layout of the General Ledger export.
 var generalLedgerHeader = []string{
-	"account_code", "account_name", "account_type",
+	"account_code", "account_name", "account_type", "currency",
 	"entry_date", "journal_entry_id", "line_id", "line_number",
 	"reference", "description", "memo",
 	"debit", "credit", "running_balance",
@@ -40,6 +40,41 @@ func FormatCents(c int64) string {
 		u = uint64(-(c + 1)) + 1 // correct even for math.MinInt64
 	}
 	return fmt.Sprintf("%s%d.%02d", sign, u/100, u%100)
+}
+
+// ParseCents parses a non-negative decimal amount with at most two fraction
+// digits ("1234", "1234.5", "1234.56") into cents, using integer arithmetic
+// only. An empty string is zero. Thousands separators, signs, currency
+// symbols and exponents are rejected.
+func ParseCents(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	whole, frac, hasDot := strings.Cut(s, ".")
+	if whole == "" || len(frac) > 2 || (hasDot && frac == "") {
+		return 0, fmt.Errorf("invalid amount %q: use digits with up to two decimals, e.g. 1234.56", s)
+	}
+	for _, part := range []string{whole, frac} {
+		for _, r := range part {
+			if r < '0' || r > '9' {
+				return 0, fmt.Errorf("invalid amount %q: use digits with up to two decimals, e.g. 1234.56", s)
+			}
+		}
+	}
+	for len(frac) < 2 {
+		frac += "0"
+	}
+	w, err := strconv.ParseInt(whole, 10, 64)
+	if err != nil || w > MaxCents/100 {
+		return 0, fmt.Errorf("amount %q is too large", s)
+	}
+	f, _ := strconv.ParseInt(frac, 10, 64)
+	c := w*100 + f
+	if c > MaxCents {
+		return 0, fmt.Errorf("amount %q is too large", s)
+	}
+	return c, nil
 }
 
 // csvText neutralises spreadsheet formula injection: text cells starting with
@@ -58,15 +93,22 @@ func csvText(s string) string {
 // a.CSVDir and returns its metadata.
 //
 // When from is set, each account's balance before that date is emitted as an
-// "Opening balance" row so running balances stay correct.
+// "Opening balance" row so running balances stay correct. Each account has a
+// single currency, so every running balance is in one currency; currency
+// limits the export to accounts in that currency.
 //
 // The file is written to a temporary name, fsynced, then renamed into place,
 // so readers on the share never see a partially written export.
-func (a *App) ExportGeneralLedger(ctx context.Context, from, to *Date) (*CsvFile, error) {
+func (a *App) ExportGeneralLedger(ctx context.Context, from, to *Date, currency *Currency) (*CsvFile, error) {
+	v := &ValidationError{}
 	if from != nil && to != nil && to.Before(from.Time) {
-		v := &ValidationError{}
 		v.add("to", "must not be before from")
-		return nil, v
+	}
+	if currency != nil && !currency.Valid() {
+		v.add("currency", "must be CAD or USD")
+	}
+	if err := v.orNil(); err != nil {
+		return nil, err
 	}
 
 	tmp, err := os.CreateTemp(a.CSVDir, ".general_ledger-*.tmp")
@@ -83,7 +125,7 @@ func (a *App) ExportGeneralLedger(ctx context.Context, from, to *Date) (*CsvFile
 	}()
 
 	bw := bufio.NewWriterSize(tmp, 64*1024)
-	rowCount, err := a.writeGeneralLedgerCSV(ctx, bw, from, to)
+	rowCount, err := a.writeGeneralLedgerCSV(ctx, bw, from, to, currency)
 	if err != nil {
 		return nil, err
 	}
@@ -117,14 +159,14 @@ func (a *App) ExportGeneralLedger(ctx context.Context, from, to *Date) (*CsvFile
 
 // writeGeneralLedgerCSV streams the ledger from a single SQL statement (one
 // consistent snapshot) into w and returns the number of data rows written.
-func (a *App) writeGeneralLedgerCSV(ctx context.Context, w *bufio.Writer, from, to *Date) (int, error) {
+func (a *App) writeGeneralLedgerCSV(ctx context.Context, w *bufio.Writer, from, to *Date, currency *Currency) (int, error) {
 	cw := csv.NewWriter(w) // RFC 4180 quoting; "\n" line endings
 	if err := cw.Write(generalLedgerHeader); err != nil {
 		return 0, err
 	}
 
 	rows, err := a.DB.Query(ctx, `
-		SELECT a.code, a.name, a.type::text, x.kind, x.entry_date,
+		SELECT a.code, a.name, a.type::text, a.currency, x.kind, x.entry_date,
 		       x.journal_entry_id, x.line_id, x.line_number,
 		       x.reference, x.description, x.memo, x.amount
 		  FROM (
@@ -149,21 +191,22 @@ func (a *App) writeGeneralLedgerCSV(ctx context.Context, w *bufio.Writer, from, 
 		           AND ($2::date IS NULL OR e.entry_date <= $2::date)
 		       ) x
 		  JOIN accounts a ON a.id = x.account_id
+		 WHERE ($3::text IS NULL OR a.currency = $3)
 		 ORDER BY a.code, x.kind, x.entry_date, x.journal_entry_id, x.line_number`,
-		dateArg(from), dateArg(to))
+		dateArg(from), dateArg(to), currency)
 	if err != nil {
 		return 0, fmt.Errorf("query general ledger: %w", err)
 	}
 
 	var (
-		code, name, typ, reference, description, memo string
-		kind, lineNumber                              int
-		entryDate                                     Date
-		entryID, lineID                               *int64
-		amount, running                               int64
-		currentCode                                   string
-		count                                         int
-		record                                        = make([]string, len(generalLedgerHeader))
+		code, name, typ, cur, reference, description, memo string
+		kind, lineNumber                                   int
+		entryDate                                          Date
+		entryID, lineID                                    *int64
+		amount, running                                    int64
+		currentCode                                        string
+		count                                              int
+		record                                             = make([]string, len(generalLedgerHeader))
 	)
 	optID := func(p *int64) string {
 		if p == nil {
@@ -173,7 +216,7 @@ func (a *App) writeGeneralLedgerCSV(ctx context.Context, w *bufio.Writer, from, 
 	}
 
 	_, err = pgx.ForEachRow(rows,
-		[]any{&code, &name, &typ, &kind, &entryDate, &entryID, &lineID, &lineNumber, &reference, &description, &memo, &amount},
+		[]any{&code, &name, &typ, &cur, &kind, &entryDate, &entryID, &lineID, &lineNumber, &reference, &description, &memo, &amount},
 		func() error {
 			if code != currentCode || count == 0 {
 				currentCode, running = code, 0
@@ -195,16 +238,17 @@ func (a *App) writeGeneralLedgerCSV(ctx context.Context, w *bufio.Writer, from, 
 			record[0] = csvText(code)
 			record[1] = csvText(name)
 			record[2] = typ
-			record[3] = entryDate.String()
-			record[4] = optID(entryID)
-			record[5] = optID(lineID)
-			record[6] = lineNo
-			record[7] = csvText(reference)
-			record[8] = csvText(description)
-			record[9] = csvText(memo)
-			record[10] = debit
-			record[11] = credit
-			record[12] = FormatCents(running)
+			record[3] = cur
+			record[4] = entryDate.String()
+			record[5] = optID(entryID)
+			record[6] = optID(lineID)
+			record[7] = lineNo
+			record[8] = csvText(reference)
+			record[9] = csvText(description)
+			record[10] = csvText(memo)
+			record[11] = debit
+			record[12] = credit
+			record[13] = FormatCents(running)
 			count++
 			return cw.Write(record)
 		})

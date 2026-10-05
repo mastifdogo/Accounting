@@ -5,10 +5,16 @@
 -- database is the final authority):
 --
 --   1. Every journal entry has at least two transaction lines.
---   2. The signed sum of a journal entry's lines is exactly zero
---      (debits are stored as positive cents, credits as negative cents).
+--   2. For EACH CURRENCY in a journal entry, the signed sum of its lines is
+--      exactly zero (debits are stored as positive cents, credits as negative
+--      cents). Supported currencies: CAD and USD.
 --   3. Money is stored as BIGINT cents. No floating point anywhere.
---   4. Posted journal entries and transaction lines are immutable:
+--   4a. Every account has one fixed currency, and every line is in its
+--      account's currency (composite foreign key). Cross-currency movements
+--      are posted through an FX clearing account in each currency, so every
+--      currency balances on its own and no exchange rates are stored.
+--   4. Posted journal entries, transaction lines and CSV import records are
+--      immutable:
 --      UPDATE, DELETE and TRUNCATE are rejected. Corrections are made by
 --      posting a reversing entry.
 --   5. Lines can only be added to a journal entry inside the same database
@@ -31,21 +37,58 @@ BEGIN;
 CREATE TYPE account_type AS ENUM ('asset', 'liability', 'equity', 'revenue', 'expense');
 
 -- -----------------------------------------------------------------------------
--- accounts: the chart of accounts
+-- currencies: the ledger works in cents, so only 2-decimal currencies allowed
+-- -----------------------------------------------------------------------------
+CREATE TABLE currencies (
+    code        CHAR(3)  PRIMARY KEY,
+    name        TEXT     NOT NULL,
+    minor_units SMALLINT NOT NULL DEFAULT 2,
+
+    CONSTRAINT currencies_code_format CHECK (code ~ '^[A-Z]{3}$'),
+    CONSTRAINT currencies_cents_only  CHECK (minor_units = 2)
+);
+
+INSERT INTO currencies (code, name) VALUES
+    ('CAD', 'Canadian dollar'),
+    ('USD', 'US dollar');
+
+-- -----------------------------------------------------------------------------
+-- accounts: the chart of accounts. `code` is the public identifier used by the
+-- API and CSV files; `id` is internal.
 -- -----------------------------------------------------------------------------
 CREATE TABLE accounts (
     id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     code        TEXT         NOT NULL,
     name        TEXT         NOT NULL,
     type        account_type NOT NULL,
+    currency    CHAR(3)      NOT NULL REFERENCES currencies (code) ON DELETE RESTRICT,
     description TEXT         NOT NULL DEFAULT '',
     is_active   BOOLEAN      NOT NULL DEFAULT TRUE,
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
 
     CONSTRAINT accounts_code_unique   UNIQUE (code),
+    -- Target of the transactions (account_id, currency) foreign key.
+    CONSTRAINT accounts_id_currency_unique UNIQUE (id, currency),
     CONSTRAINT accounts_code_format   CHECK (code ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$'),
     CONSTRAINT accounts_name_nonempty CHECK (length(btrim(name)) BETWEEN 1 AND 200)
+);
+
+-- -----------------------------------------------------------------------------
+-- csv_imports: one row per imported CSV file. The SHA-256 of the file content
+-- is unique, so the same file can never be imported twice.
+-- -----------------------------------------------------------------------------
+CREATE TABLE csv_imports (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    filename    TEXT        NOT NULL,
+    sha256      CHAR(64)    NOT NULL,
+    entry_count INTEGER     NOT NULL,
+    line_count  INTEGER     NOT NULL,
+    imported_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT csv_imports_sha256_unique UNIQUE (sha256),
+    CONSTRAINT csv_imports_sha256_format CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT csv_imports_counts        CHECK (entry_count >= 1 AND line_count >= 2 * entry_count)
 );
 
 -- -----------------------------------------------------------------------------
@@ -59,6 +102,8 @@ CREATE TABLE journal_entries (
     -- If this entry reverses another, points at the original. An entry can be
     -- reversed at most once.
     reverses_id  BIGINT      REFERENCES journal_entries (id) ON DELETE RESTRICT,
+    -- Set when the entry was created by a CSV import.
+    import_id    BIGINT      REFERENCES csv_imports (id) ON DELETE RESTRICT,
     posted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- ID of the database transaction that created this row. Always overwritten
     -- by trigger; used to stop lines being appended to an already-posted entry.
@@ -71,6 +116,7 @@ CREATE TABLE journal_entries (
 );
 
 CREATE INDEX journal_entries_entry_date_idx ON journal_entries (entry_date, id);
+CREATE INDEX journal_entries_import_idx     ON journal_entries (import_id) WHERE import_id IS NOT NULL;
 
 -- -----------------------------------------------------------------------------
 -- transactions: the individual debit/credit lines of a journal entry
@@ -82,10 +128,18 @@ CREATE INDEX journal_entries_entry_date_idx ON journal_entries (entry_date, id);
 CREATE TABLE transactions (
     id               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     journal_entry_id BIGINT NOT NULL REFERENCES journal_entries (id) ON DELETE RESTRICT,
-    account_id       BIGINT NOT NULL REFERENCES accounts (id)        ON DELETE RESTRICT,
+    account_id       BIGINT NOT NULL,
+    currency         CHAR(3) NOT NULL,
     line_number      INTEGER NOT NULL,
     amount           BIGINT NOT NULL,
     memo             TEXT   NOT NULL DEFAULT '',
+
+    -- A line is always in its account's currency. Because this FK references
+    -- (id, currency), an account's currency also cannot change once it has
+    -- postings.
+    CONSTRAINT transactions_account_currency_fkey
+        FOREIGN KEY (account_id, currency) REFERENCES accounts (id, currency)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
 
     CONSTRAINT transactions_amount_nonzero  CHECK (amount <> 0),
     -- Exclude the BIGINT minimum so that negating any amount can never overflow.
@@ -101,23 +155,21 @@ CREATE INDEX transactions_account_idx ON transactions (account_id, journal_entry
 -- Trigger functions
 -- =============================================================================
 
--- Shared balance check: >= 2 lines and signed sum exactly zero.
+-- Shared balance check: >= 2 lines and, per currency, signed sum exactly zero.
 -- SUM over BIGINT returns NUMERIC, so it cannot overflow while summing.
 CREATE FUNCTION assert_journal_entry_balanced(p_entry_id BIGINT) RETURNS VOID
 LANGUAGE plpgsql AS $$
 DECLARE
-    v_lines INTEGER;
-    v_sum   NUMERIC;
+    v_lines    INTEGER;
+    v_currency CHAR(3);
+    v_sum      NUMERIC;
 BEGIN
     -- Defensive: nothing to check if the header does not exist.
     IF NOT EXISTS (SELECT 1 FROM journal_entries WHERE id = p_entry_id) THEN
         RETURN;
     END IF;
 
-    SELECT count(*), COALESCE(sum(amount), 0)
-      INTO v_lines, v_sum
-      FROM transactions
-     WHERE journal_entry_id = p_entry_id;
+    SELECT count(*) INTO v_lines FROM transactions WHERE journal_entry_id = p_entry_id;
 
     IF v_lines < 2 THEN
         RAISE EXCEPTION 'journal entry % must have at least 2 transaction lines (has %)', p_entry_id, v_lines
@@ -125,8 +177,18 @@ BEGIN
                     CONSTRAINT = 'journal_entry_min_lines';
     END IF;
 
-    IF v_sum <> 0 THEN
-        RAISE EXCEPTION 'journal entry % is unbalanced: debits minus credits = % cents', p_entry_id, v_sum
+    SELECT currency, sum(amount)
+      INTO v_currency, v_sum
+      FROM transactions
+     WHERE journal_entry_id = p_entry_id
+     GROUP BY currency
+    HAVING sum(amount) <> 0
+     ORDER BY currency
+     LIMIT 1;
+
+    IF FOUND THEN
+        RAISE EXCEPTION 'journal entry % is unbalanced in %: debits minus credits = % cents',
+                        p_entry_id, v_currency, v_sum
               USING ERRCODE = 'check_violation',
                     CONSTRAINT = 'journal_entry_balanced';
     END IF;
@@ -200,8 +262,8 @@ BEGIN
 END;
 $$;
 
--- Accounts may be renamed or deactivated, but their type is fixed once they
--- have postings (changing it would silently rewrite historical reports), and
+-- Accounts may be renamed or deactivated, but their code never changes and
+-- their type and currency are fixed once they have postings (changing it would silently rewrite historical reports), and
 -- accounts with postings are protected from deletion by the FK as well.
 CREATE FUNCTION trg_accounts_before_update() RETURNS TRIGGER
 LANGUAGE plpgsql AS $$
@@ -209,6 +271,19 @@ BEGIN
     IF NEW.id <> OLD.id THEN
         RAISE EXCEPTION 'account id cannot be changed'
               USING ERRCODE = 'restrict_violation', CONSTRAINT = 'account_id_immutable';
+    END IF;
+
+    -- The code is the account's public identifier (API, CSV files), so it
+    -- never changes.
+    IF NEW.code <> OLD.code THEN
+        RAISE EXCEPTION 'account code % cannot be changed', OLD.code
+              USING ERRCODE = 'restrict_violation', CONSTRAINT = 'account_code_immutable';
+    END IF;
+
+    IF NEW.currency <> OLD.currency
+       AND EXISTS (SELECT 1 FROM transactions WHERE account_id = OLD.id) THEN
+        RAISE EXCEPTION 'account % has postings; its currency cannot be changed', OLD.code
+              USING ERRCODE = 'restrict_violation', CONSTRAINT = 'account_currency_immutable';
     END IF;
 
     IF NEW.type <> OLD.type
@@ -270,6 +345,18 @@ CREATE TRIGGER accounts_before_update
     BEFORE UPDATE ON accounts
     FOR EACH ROW EXECUTE FUNCTION trg_accounts_before_update();
 
+CREATE TRIGGER csv_imports_no_update_delete
+    BEFORE UPDATE OR DELETE ON csv_imports
+    FOR EACH ROW EXECUTE FUNCTION trg_reject_modification();
+
+CREATE TRIGGER csv_imports_no_truncate
+    BEFORE TRUNCATE ON csv_imports
+    FOR EACH STATEMENT EXECUTE FUNCTION trg_reject_modification();
+
+CREATE TRIGGER currencies_no_truncate
+    BEFORE TRUNCATE ON currencies
+    FOR EACH STATEMENT EXECUTE FUNCTION trg_reject_modification();
+
 CREATE TRIGGER accounts_no_truncate
     BEFORE TRUNCATE ON accounts
     FOR EACH STATEMENT EXECUTE FUNCTION trg_reject_modification();
@@ -283,8 +370,9 @@ CREATE TRIGGER accounts_no_truncate
 --   CREATE ROLE ledger_app LOGIN PASSWORD '...';
 --   GRANT USAGE ON SCHEMA public TO ledger_app;
 --   GRANT SELECT, INSERT, UPDATE ON accounts TO ledger_app;
---   GRANT SELECT, INSERT ON journal_entries, transactions TO ledger_app;
---   REVOKE UPDATE, DELETE, TRUNCATE ON journal_entries, transactions FROM ledger_app;
+--   GRANT SELECT ON currencies TO ledger_app;
+--   GRANT SELECT, INSERT ON journal_entries, transactions, csv_imports TO ledger_app;
+--   REVOKE UPDATE, DELETE, TRUNCATE ON journal_entries, transactions, csv_imports FROM ledger_app;
 -- =============================================================================
 
 COMMIT;
