@@ -6,7 +6,7 @@ Lightweight double-entry accounting web app, sized for a low-resource Proxmox LX
 |----------|------------------------------------------------------------------|
 | Backend  | Go, single static binary (`CGO_ENABLED=0`), `chi` router, `pgx`  |
 | Database | PostgreSQL 13+                                                   |
-| Frontend | SvelteKit + `adapter-static`, served by the Go binary (Step 2)   |
+| Frontend | SvelteKit 3 SPA (`adapter-static`), embedded in the Go binary    |
 | Files    | CSV import/export in `/app/csv_data` (TrueNAS bind mount)        |
 | Contract | [`api/openapi.yaml`](api/openapi.yaml)                           |
 
@@ -20,7 +20,10 @@ backend/ledger.go     Journal entry validation, transactional posting, reversal
 backend/accounts.go   Chart of accounts, account ledger, trial balance
 backend/export.go     General Ledger CSV export, CSV file listing/download
 backend/import.go     All-or-nothing CSV import of journal entries
-backend/handlers.go   HTTP handlers and error mapping
+backend/upload.go     CSV upload (never overwrites)
+backend/static.go     Serves the embedded frontend (backend/web) with SPA fallback
+backend/handlers.go   HTTP handlers, error mapping, request safety
+frontend/             SvelteKit app; API types generated from api/openapi.yaml
 ```
 
 ## Accounting rules and where they are enforced
@@ -76,9 +79,29 @@ Optional columns: `reference`, `memo`, `currency`. Full rules are in
 
 ```sh
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/schema.sql
-make build
+make build            # npm ci + vite build, then a static Go binary embedding it
 DATABASE_URL=postgres://ledger_app:...@db/ledger ./bin/ledger
 ```
+
+Open `http://<container>:8080/`. The only runtime artifact is `bin/ledger`
+(~12 MB); Node is needed at build time only.
+
+> **No login yet.** Anyone who can reach port 8080 can post entries. Keep it on
+> a trusted LAN/VPN or behind an authenticating reverse proxy until
+> authentication is added. Cross-site requests from other web pages are
+> already blocked (`Sec-Fetch-Site`/`Origin` checks, JSON-only bodies).
+
+### Frontend development
+
+```sh
+./bin/ledger &                 # API on :8080
+cd frontend && npm run dev     # Vite on :5173, proxies /api to :8080
+make api-types                 # after editing api/openapi.yaml
+```
+
+The frontend only talks to the API through `openapi-fetch` with types
+generated from `api/openapi.yaml`, so a contract change that breaks the UI
+fails `npm run check`.
 
 | Variable       | Default          |
 |----------------|------------------|
@@ -93,7 +116,7 @@ disable the triggers (see the end of `db/schema.sql`).
 ## Tests
 
 ```sh
-make test                                                       # unit tests
+make test                                                       # Go + frontend checks/unit tests
 make test-integration TEST_DATABASE_URL=postgres://postgres@localhost/postgres
 ```
 

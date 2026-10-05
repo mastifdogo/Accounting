@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
@@ -19,12 +20,18 @@ import (
 
 const maxBodyBytes = 1 << 20 // 1 MiB
 
-// Routes builds the HTTP router. Paths match api/openapi.yaml under /api/v1.
+// Routes builds the HTTP router. Paths match api/openapi.yaml under /api/v1;
+// everything else serves the embedded SvelteKit frontend.
 func (a *App) Routes() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
 	r.Use(requestLogger)
+	r.Use(securityHeaders)
+	// Reject cross-site state-changing requests (checks Sec-Fetch-Site and
+	// Origin), so another web page open in the same browser cannot post
+	// entries or upload files to this server.
+	r.Use(crossOriginGuard)
 
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Use(middleware.Timeout(60 * time.Second))
@@ -47,6 +54,7 @@ func (a *App) Routes() http.Handler {
 
 		r.Post("/exports/general-ledger", a.handleExportGeneralLedger)
 		r.Get("/files", a.handleListFiles)
+		r.Post("/files", a.handleUploadFile)
 		r.Get("/files/{filename}", a.handleDownloadFile)
 		r.Post("/imports/journal-entries", a.handleImportJournalEntries)
 
@@ -58,8 +66,29 @@ func (a *App) Routes() http.Handler {
 		})
 	})
 
-	// Step 2: the SvelteKit static build will be served from here.
+	r.Handle("/api/*", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, http.StatusNotFound, "not_found", "no such endpoint", nil)
+	}))
+	r.Handle("/*", staticHandler())
 	return r
+}
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "same-origin")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func crossOriginGuard(next http.Handler) http.Handler {
+	cop := http.NewCrossOriginProtection()
+	cop.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, http.StatusForbidden, "forbidden", "cross-origin request rejected", nil)
+	}))
+	return cop.Handler(next)
 }
 
 func requestLogger(next http.Handler) http.Handler {
@@ -301,6 +330,48 @@ func (a *App) handleDownloadFile(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, name, info.ModTime(), f)
 }
 
+func (a *App) handleUploadFile(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes+64<<10) // + multipart overhead
+	mr, err := r.MultipartReader()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "expected a multipart/form-data body with a \"file\" field", nil)
+		return
+	}
+	for {
+		part, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				writeErr(w, r, ErrTooLarge)
+			} else {
+				writeError(w, http.StatusBadRequest, "bad_request", "invalid multipart body: "+err.Error(), nil)
+			}
+			return
+		}
+		if part.FormName() != "file" {
+			part.Close()
+			continue
+		}
+		// FileName() is already reduced to its base name by mime/multipart.
+		f, err := a.SaveUploadedCsv(part.FileName(), part)
+		part.Close()
+		if err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				err = ErrTooLarge
+			}
+			writeErr(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, f)
+		return
+	}
+	writeError(w, http.StatusBadRequest, "bad_request", "missing \"file\" field", nil)
+}
+
 func (a *App) handleImportJournalEntries(w http.ResponseWriter, r *http.Request) {
 	var req ImportRequest
 	if !decodeJSON(w, r, &req, true) {
@@ -326,8 +397,15 @@ func (a *App) handleImportJournalEntries(w http.ResponseWriter, r *http.Request)
 
 // decodeJSON decodes a JSON body, rejecting unknown fields (the OpenAPI
 // schemas set additionalProperties: false). An empty body is accepted when
-// required is false.
+// required is false. A non-empty body must be sent as application/json,
+// which browsers cannot do cross-origin without a CORS preflight.
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any, required bool) bool {
+	if ct := r.Header.Get("Content-Type"); ct != "" || r.ContentLength > 0 {
+		if mt, _, _ := mime.ParseMediaType(ct); mt != "application/json" {
+			writeError(w, http.StatusUnsupportedMediaType, "bad_request", "Content-Type must be application/json", nil)
+			return false
+		}
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
@@ -341,7 +419,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any, required bool) 
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "bad_request", "request body too large", nil)
+			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "request body too large", nil)
 		} else if errors.Is(err, io.EOF) {
 			writeError(w, http.StatusBadRequest, "bad_request", "request body is required", nil)
 		} else {
@@ -447,6 +525,9 @@ func writeErr(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.As(err, &ve):
 		writeError(w, http.StatusUnprocessableEntity, "validation_failed", "request validation failed", ve.Details)
+	case errors.Is(err, ErrTooLarge):
+		writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large",
+			fmt.Sprintf("file is larger than %d bytes", maxUploadBytes), nil)
 	case errors.Is(err, ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "not found", nil)
 	case errors.As(err, &ce):

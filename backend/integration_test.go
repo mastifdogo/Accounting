@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -99,6 +100,9 @@ func call(t *testing.T, h http.Handler, method, path string, body any) apiResp {
 		rd = bytes.NewReader(b)
 	}
 	req := httptest.NewRequest(method, "/api/v1"+path, rd)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return apiResp{Status: rec.Code, Body: rec.Body.Bytes()}
@@ -523,5 +527,96 @@ func TestImportJournalEntries(t *testing.T) {
 	r.decode(t, &tb)
 	if len(tb.Totals) != 2 || tb.Totals[0].DebitCents != 25000 || tb.Totals[1].DebitCents != 10000 {
 		t.Fatalf("unexpected trial balance after import: %+v", tb.Totals)
+	}
+}
+
+func upload(t *testing.T, h http.Handler, filename string, content []byte, headers map[string]string) apiResp {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, err := mw.CreateFormFile("file", filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fw.Write(content)
+	mw.Close()
+	req := httptest.NewRequest("POST", "/api/v1/files", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return apiResp{Status: rec.Code, Body: rec.Body.Bytes()}
+}
+
+func TestUploadAndRequestSafety(t *testing.T) {
+	app, h := setupTestApp(t)
+	createAccount(t, h, "1000", "Bank CAD", AccountAsset, CurrencyCAD)
+	createAccount(t, h, "4000", "Sales", AccountRevenue, CurrencyCAD)
+
+	content := []byte("entry_key,entry_date,description,account_code,debit,credit\nS1,2026-10-01,Sale,1000,5.00,\nS1,,,4000,,5.00\n")
+
+	// Upload, then import the uploaded file.
+	r := upload(t, h, "sales.csv", content, nil)
+	expectStatus(t, r, http.StatusCreated)
+	var f CsvFile
+	r.decode(t, &f)
+	if f.Filename != "sales.csv" || f.SizeBytes != int64(len(content)) {
+		t.Fatalf("unexpected upload result: %+v", f)
+	}
+	got, _ := os.ReadFile(filepath.Join(app.CSVDir, "sales.csv"))
+	if !bytes.Equal(got, content) {
+		t.Fatal("stored file differs from upload")
+	}
+	expectStatus(t, call(t, h, "POST", "/imports/journal-entries", ImportRequest{Filename: "sales.csv"}), http.StatusCreated)
+
+	// Never overwrite; reject bad names, binary content, empty and huge files.
+	expectStatus(t, upload(t, h, "sales.csv", []byte("x"), nil), http.StatusConflict)
+	expectStatus(t, upload(t, h, "evil.sh", content, nil), http.StatusUnprocessableEntity)
+	expectStatus(t, upload(t, h, ".hidden.csv", content, nil), http.StatusUnprocessableEntity)
+	// Path components are stripped: the file lands inside the CSV directory.
+	expectStatus(t, upload(t, h, "../../escape.csv", content, nil), http.StatusCreated)
+	if _, err := os.Stat(filepath.Join(app.CSVDir, "escape.csv")); err != nil {
+		t.Fatal("expected escape.csv inside the CSV directory")
+	}
+	expectStatus(t, upload(t, h, "bin.csv", []byte{0xff, 0xfe, 0x00, 0x01}, nil), http.StatusUnprocessableEntity)
+	expectStatus(t, upload(t, h, "empty.csv", nil, nil), http.StatusUnprocessableEntity)
+	expectStatus(t, upload(t, h, "huge.csv", bytes.Repeat([]byte("a"), maxUploadBytes+1), nil), http.StatusRequestEntityTooLarge)
+	if _, err := os.Stat(filepath.Join(filepath.Dir(app.CSVDir), "escape.csv")); err == nil {
+		t.Fatal("upload escaped the CSV directory")
+	}
+	tmps, _ := filepath.Glob(filepath.Join(app.CSVDir, ".*.tmp"))
+	if len(tmps) != 0 {
+		t.Fatalf("temp files left behind: %v", tmps)
+	}
+
+	// Cross-site browser requests are refused.
+	expectStatus(t, upload(t, h, "csrf.csv", content, map[string]string{"Sec-Fetch-Site": "cross-site"}), http.StatusForbidden)
+	expectStatus(t, upload(t, h, "csrf2.csv", content, map[string]string{"Origin": "http://evil.example"}), http.StatusForbidden)
+	expectStatus(t, upload(t, h, "same.csv", content, map[string]string{"Sec-Fetch-Site": "same-origin"}), http.StatusCreated)
+
+	// JSON endpoints require application/json (a text/plain form post is a
+	// CORS "simple request" a malicious page could send).
+	req := httptest.NewRequest("POST", "/api/v1/accounts", strings.NewReader(`{"code":"5000","name":"X","type":"expense","currency":"CAD"}`))
+	req.Header.Set("Content-Type", "text/plain")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	expectStatus(t, apiResp{Status: rec.Code, Body: rec.Body.Bytes()}, http.StatusUnsupportedMediaType)
+
+	// Non-API paths serve the frontend (or its placeholder); unknown API paths are JSON 404s.
+	for path, want := range map[string]int{"/": 200, "/journal/new": 200, "/api/v2/nope": 404, "/api/v1/nope": 404} {
+		req := httptest.NewRequest("GET", path, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Errorf("GET %s = %d, want %d", path, rec.Code, want)
+		}
+		if strings.HasPrefix(path, "/api/") && !strings.Contains(rec.Body.String(), `"not_found"`) {
+			t.Errorf("GET %s: expected JSON error, got %s", path, rec.Body.String())
+		}
+		if rec.Header().Get("X-Frame-Options") != "DENY" {
+			t.Errorf("GET %s: missing security headers", path)
+		}
 	}
 }

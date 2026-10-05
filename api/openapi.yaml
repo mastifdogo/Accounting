@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Ledger API
-  version: 0.2.0
+  version: 0.3.0
   description: |
     API for a lightweight double-entry accounting ledger.
 
@@ -40,7 +40,14 @@ info:
 
     ## CSV files
     Exports and imports live in the server's CSV directory (`/app/csv_data`).
-    Files are UTF-8 encoded, comma separated, with a header row and no BOM.
+    Exports are UTF-8 encoded, comma separated, with a header row and no BOM.
+    Files can be added by uploading them (`POST /files`) or by copying them
+    to the share directly.
+
+    ## Requests
+    JSON request bodies must be sent with `Content-Type: application/json`
+    (otherwise 415). Cross-site state-changing requests from browsers are
+    rejected with 403, so other web pages cannot act on the ledger.
 servers:
   - url: /api/v1
 
@@ -347,6 +354,37 @@ paths:
                     type: array
                     items: { $ref: '#/components/schemas/CsvFile' }
         default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [Files]
+      operationId: uploadCsvFile
+      summary: Upload a CSV file into the CSV directory
+      description: |
+        The file is stored under its own name, which must match the
+        `CsvFilename` pattern. Existing files are never overwritten (409).
+        Max 10 MiB; content must be UTF-8 text (a leading BOM is allowed).
+        Uploading does not import anything: call `POST /imports/journal-entries`
+        afterwards.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        '201':
+          description: File stored
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CsvFile' }
+        '409': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
 
   /files/{filename}:
     parameters:
@@ -519,6 +557,8 @@ components:
                 - validation_failed
                 - not_found
                 - conflict
+                - forbidden
+                - payload_too_large
                 - internal_error
             message: { type: string }
             details:

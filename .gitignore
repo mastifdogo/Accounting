@@ -2,3 +2,5 @@
 *.test
 *.out
 .env
+/backend/web/*
+!/backend/web/.gitkeep
