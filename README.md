@@ -10,6 +10,93 @@ Lightweight double-entry accounting web app, sized for a low-resource Proxmox LX
 | Files    | CSV import/export in `/app/csv_data` (TrueNAS bind mount)        |
 | Contract | [`api/openapi.yaml`](api/openapi.yaml)                           |
 
+## Installation
+
+### On Proxmox (one command)
+
+`deploy/proxmox-deploy.sh` runs on the **Proxmox host** as root. It creates the
+LXC container and installs everything inside it.
+
+1. Build a release on a machine with Go 1.25+ and Node.js 22:
+
+   ```sh
+   make release        # dist/ledger-<version>-linux-amd64.tar.gz  (GOARCH=arm64 for ARM)
+   ```
+
+2. Copy the tarball to the Proxmox host, unpack it and run the script, pointing
+   `--csv-path` at a directory on your TrueNAS mount:
+
+   ```sh
+   scp dist/ledger-*-linux-amd64.tar.gz root@proxmox:/root/
+   ssh root@proxmox
+   tar xzf ledger-*-linux-amd64.tar.gz && cd ledger-*-linux-amd64
+   ./deploy/proxmox-deploy.sh --csv-path /mnt/pve/truenas/ledger
+   ```
+
+3. Open the URL it prints and log in with the admin username and the generated
+   password (shown once; change it under **Settings**).
+
+The script will:
+
+- download the latest Debian 12 template if needed
+- create an unprivileged container (`nesting=1`) with the CSV directory
+  bind-mounted at `/app/csv_data`, owned by the mapped service UID (100990)
+- install PostgreSQL (tuned for a small container), Ledger, the systemd service
+  and nightly backups to `/app/csv_data/backups`
+- create the database with a restricted app role, plus the admin user
+- start everything and check `/api/v1/health` and that the share is writable
+
+Common options (`--help` lists them all):
+
+| Option | Purpose | Default |
+|--------|---------|---------|
+| `--csv-path DIR` | host directory to bind-mount (required) | — |
+| `--ctid ID` | container ID | next free |
+| `--hostname NAME` | container hostname | `ledger` |
+| `--ip CIDR --gateway IP` | static address, e.g. `192.168.1.50/24` | DHCP |
+| `--vlan TAG`, `--bridge NAME`, `--nameserver IP` | network | `vmbr0` |
+| `--cores N --memory MB --disk GB --storage NAME` | sizing | 1, 512, 4, `local-lvm` |
+| `--port N` | web port | `8080` |
+| `--admin-user NAME` | first login user | `admin` |
+| `--admin-password-file FILE` | use this password instead of generating one | generated |
+| `--ssh-keys FILE` | authorized_keys for root in the container | none |
+| `--no-chown` | leave CSV directory ownership alone (TrueNAS NFS "Mapall") | chown |
+| `--release FILE` | release tarball to install | the unpacked release |
+| `--dry-run` | print every command without running it | off |
+| `-y` | don't ask for confirmation | ask |
+
+Example with a static address:
+
+```sh
+./deploy/proxmox-deploy.sh --csv-path /mnt/pve/truenas/ledger \
+  --ctid 120 --ip 192.168.1.50/24 --gateway 192.168.1.1 --admin-user alice
+```
+
+**Upgrading** to a new release backs up the database first, then keeps the
+configuration and port:
+
+```sh
+./deploy/proxmox-deploy.sh --upgrade --ctid 120 --release ledger-<new>-linux-amd64.tar.gz
+```
+
+### On any Debian/Ubuntu host or container
+
+Without Proxmox, run the steps the script automates yourself, as root, from
+the unpacked release:
+
+```sh
+apt install -y postgresql
+sh deploy/install.sh                                  # user, binary, systemd units, /etc/ledger/ledger.env
+cp /usr/local/share/ledger/postgresql-lowmem.conf /etc/postgresql/*/main/conf.d/ledger.conf
+systemctl restart postgresql
+sh /usr/local/share/ledger/setup-db.sh                # roles, schema, grants; writes DATABASE_URL
+ledger-user add alice                                 # prompts for a password
+systemctl enable --now ledger ledger-backup.timer
+```
+
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) explains every step, plus TrueNAS
+permissions, HTTPS behind a reverse proxy, backup/restore and troubleshooting.
+
 ## Layout
 
 ```
@@ -27,7 +114,7 @@ backend/cli.go        `ledger user add|passwd|disable|enable|list`
 backend/static.go     Serves the embedded frontend (backend/web) with SPA fallback
 backend/handlers.go   HTTP handlers, error mapping, request safety
 frontend/             SvelteKit app; API types generated from api/openapi.yaml
-deploy/               systemd units, install/DB setup scripts, backups
+deploy/               proxmox-deploy.sh, install.sh, setup-db.sh, systemd units, backups
 docs/DEPLOYMENT.md    Proxmox LXC + TrueNAS deployment guide
 ```
 
@@ -85,16 +172,8 @@ Optional columns: `reference`, `memo`, `currency`. Full rules are in
 
 ## Running
 
-**Production (Proxmox):** `make release`, copy the tarball to the Proxmox host, then
-
-```sh
-./deploy/proxmox-deploy.sh --csv-path /mnt/pve/truenas/ledger
-```
-
-This creates the LXC container and installs everything. Details, manual steps,
-HTTPS, backups and upgrades are in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
-
-**Locally:**
+For production, see [Installation](#installation). To run locally for
+development:
 
 ```sh
 createdb ledger && psql -d ledger -v ON_ERROR_STOP=1 -f db/schema.sql
@@ -138,15 +217,8 @@ The frontend only talks to the API through `openapi-fetch` with types
 generated from `api/openapi.yaml`, so a contract change that breaks the UI
 fails `npm run check`.
 
-| Variable       | Default          |
-|----------------|------------------|
-| `DATABASE_URL` | required         |
-| `HTTP_ADDR`    | `:8080`          |
-| `CSV_DIR`      | `/app/csv_data`  |
-| `DB_MAX_CONNS` | `4`              |
-
-Run the app as a role that does **not** own the tables, so it can't drop or
-disable the triggers (see the end of `db/schema.sql`).
+In production the app connects as a role that does **not** own the tables, so
+it can't drop or disable the triggers (`deploy/setup-db.sh`, `db/grants.sql`).
 
 ## Tests
 
