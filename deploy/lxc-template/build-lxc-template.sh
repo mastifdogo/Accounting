@@ -103,25 +103,35 @@ packages=(
 	systemd-sysv dbus iproute2 iputils-ping openssh-server ca-certificates
 	curl less nano procps tzdata postgresql
 )
+# Sources name the distribution's keyring explicitly (signed-by), so the
+# build works on any host: apt on an Ubuntu build machine does not trust
+# Debian's archive keys by default, and vice versa. The keyring package is
+# also installed in the image so the same path resolves inside containers.
 if [ "$DISTRO" = debian ]; then
 	MIRROR=${MIRROR:-http://deb.debian.org/debian}
+	keyring=/usr/share/keyrings/debian-archive-keyring.gpg
+	keyring_pkg=debian-archive-keyring
 	# Proxmox configures Debian guests through /etc/network/interfaces.
-	packages+=(ifupdown isc-dhcp-client)
+	packages+=(ifupdown isc-dhcp-client "$keyring_pkg")
 	sources=(
-		"deb $MIRROR $SUITE main"
-		"deb $MIRROR $SUITE-updates main"
-		"deb http://security.debian.org/debian-security $SUITE-security main"
+		"deb [signed-by=$keyring] $MIRROR $SUITE main"
+		"deb [signed-by=$keyring] $MIRROR $SUITE-updates main"
+		"deb [signed-by=$keyring] http://security.debian.org/debian-security $SUITE-security main"
 	)
 else
 	if [ "$ARCH" = arm64 ]; then MIRROR=${MIRROR:-http://ports.ubuntu.com/ubuntu-ports}; else MIRROR=${MIRROR:-http://archive.ubuntu.com/ubuntu}; fi
+	keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
+	keyring_pkg=ubuntu-keyring
 	# Proxmox configures Ubuntu guests through systemd-networkd (part of systemd)
 	# and writes /etc/resolv.conf itself, so systemd-resolved is left out.
+	packages+=("$keyring_pkg")
 	sources=(
-		"deb $MIRROR $SUITE main universe"
-		"deb $MIRROR $SUITE-updates main universe"
-		"deb $MIRROR $SUITE-security main universe"
+		"deb [signed-by=$keyring] $MIRROR $SUITE main universe"
+		"deb [signed-by=$keyring] $MIRROR $SUITE-updates main universe"
+		"deb [signed-by=$keyring] $MIRROR $SUITE-security main universe"
 	)
 fi
+[ -s "$keyring" ] || die "$keyring not found (or empty) on this machine: apt install $keyring_pkg"
 pkg_list=$(IFS=,; echo "${packages[*]}")
 
 name="$DISTRO-$OS_VERSION-ledger_${VERSION}_$ARCH.tar.zst"
