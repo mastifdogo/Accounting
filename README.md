@@ -79,6 +79,24 @@ configuration and port:
 ./deploy/proxmox-deploy.sh --upgrade --ctid 120 --release ledger-<new>-linux-amd64.tar.gz
 ```
 
+### As a Proxmox LXC template
+
+To create containers from the Proxmox GUI, build a CT template with Ledger and
+PostgreSQL pre-installed (needs root and `apt install mmdebstrap zstd`):
+
+```sh
+make lxc-template                 # dist/debian-12-ledger_<version>_amd64.tar.zst
+make lxc-template SUITE=noble     # Ubuntu 24.04 (also trixie, jammy; GOARCH=arm64)
+```
+
+Upload it under **CT Templates**, create an unprivileged container with
+nesting enabled, add the CSV bind mount
+(`pct set <ctid> -mp0 /mnt/pve/truenas/ledger,mp=/app/csv_data`) and start it.
+On first boot each container creates its own database, database password and
+`admin` login. Read the password with
+`pct exec <ctid> -- cat /root/ledger-admin-password`. Details are in
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#alternative-a-ready-made-lxc-template).
+
 ### On any Debian/Ubuntu host or container
 
 Without Proxmox, run the steps the script automates yourself, as root, from
@@ -115,6 +133,7 @@ backend/static.go     Serves the embedded frontend (backend/web) with SPA fallba
 backend/handlers.go   HTTP handlers, error mapping, request safety
 frontend/             SvelteKit app; API types generated from api/openapi.yaml
 deploy/               proxmox-deploy.sh, install.sh, setup-db.sh, systemd units, backups
+deploy/lxc-template/  LXC template builder and first-boot provisioning
 docs/DEPLOYMENT.md    Proxmox LXC + TrueNAS deployment guide
 ```
 

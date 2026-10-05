@@ -64,6 +64,66 @@ troubleshooting.
 
 ---
 
+## Alternative: a ready-made LXC template
+
+If you prefer the Proxmox GUI, or want to create several containers, build a
+**CT template** with Ledger and PostgreSQL already installed:
+
+```sh
+apt install mmdebstrap zstd             # on any Debian/Ubuntu machine, or the Proxmox host
+make lxc-template                       # dist/debian-12-ledger_<version>_amd64.tar.zst
+make lxc-template SUITE=noble           # Ubuntu 24.04 instead; also trixie, jammy; GOARCH=arm64
+# from an existing release, without the source tree:
+deploy/lxc-template/build-lxc-template.sh --release ledger-<version>-linux-amd64.tar.gz
+```
+
+The build runs as root (`mmdebstrap` installs Ledger inside the image with
+`deploy/install.sh`) and takes about a minute. The template contains **no
+secrets**: SSH host keys, machine-id and the PostgreSQL cluster are removed.
+Each container sets itself up on first boot with `ledger-firstboot.service`,
+which:
+
+- creates its own PostgreSQL cluster (tuned for a small container)
+- creates the `ledger_owner` / `ledger_app` roles with a random password,
+  written to `/etc/ledger/ledger.env`
+- creates an `admin` login with a random password in
+  `/root/ledger-admin-password` (root only)
+- checks that `/app/csv_data` is writable, then starts Ledger
+
+Using it:
+
+1. **Upload:** Datacenter → *storage* → **CT Templates** → **Upload** (or copy
+   the file to `/var/lib/vz/template/cache/` on the host).
+2. **Create:** Create CT → pick the template. Keep **Unprivileged** checked;
+   1 core, 512 MB RAM and 4 GB of disk are enough. After creating it, enable
+   Options → Features → **Nesting**, or run `pct set <ctid> --features nesting=1`.
+3. **Bind-mount the share** before the first start. Host bind mounts can only
+   be added from the host shell:
+
+   ```sh
+   pct set <ctid> -mp0 /mnt/pve/truenas/ledger,mp=/app/csv_data
+   chown 100990:100990 /mnt/pve/truenas/ledger   # or TrueNAS NFS "Mapall"; see step 3 below
+   ```
+
+4. **Start** the container and read the admin password:
+
+   ```sh
+   pct start <ctid>
+   pct exec <ctid> -- cat /root/ledger-admin-password
+   ```
+
+   (Or log in on the container's Console; the login message shows where
+   everything is.) First-boot progress: `pct exec <ctid> -- journalctl -u ledger-firstboot`.
+
+5. Browse to `http://<container-ip>:8080/`, log in as `admin` and change the
+   password under **Settings**.
+
+To upgrade a container created from a template, use
+`proxmox-deploy.sh --upgrade --ctid <ctid> --release <new tarball>` or
+`deploy/install.sh` inside it, as for any other install.
+
+---
+
 ## 1. Build a release (on your workstation)
 
 Requires Go 1.25+ and Node.js 22.
