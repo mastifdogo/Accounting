@@ -1,0 +1,18 @@
+# /etc/systemd/system/ledger-firstboot.service — runs once per container.
+[Unit]
+Description=Ledger first-boot setup (database, admin user)
+ConditionPathExists=!/var/lib/ledger/provisioned
+Wants=network-online.target
+After=network-online.target local-fs.target postgresql.service
+Before=ledger.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/ledger-firstboot
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=5min
+
+[Install]
+WantedBy=multi-user.target

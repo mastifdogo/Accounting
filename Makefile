@@ -1,7 +1,8 @@
-.PHONY: build frontend backend release test test-integration api-types schema
+.PHONY: build frontend backend release lxc-template test test-integration api-types schema
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 GOARCH  ?= amd64
+SUITE   ?= bookworm
 
 # Full build: SvelteKit static site embedded into one static Go binary.
 build: frontend backend
@@ -24,6 +25,12 @@ release: build
 	cp -R deploy docs README.md dist/ledger-$(VERSION)-linux-$(GOARCH)/
 	tar -C dist -czf dist/ledger-$(VERSION)-linux-$(GOARCH).tar.gz ledger-$(VERSION)-linux-$(GOARCH)
 	@echo "dist/ledger-$(VERSION)-linux-$(GOARCH).tar.gz"
+
+# Proxmox LXC template with Ledger + PostgreSQL pre-installed (needs root and
+# mmdebstrap). SUITE=bookworm (Debian 12, default), trixie, noble or jammy.
+lxc-template: release
+	deploy/lxc-template/build-lxc-template.sh --suite $(SUITE) --arch $(GOARCH) \
+		--release dist/ledger-$(VERSION)-linux-$(GOARCH).tar.gz
 
 # Regenerate frontend API types after editing api/openapi.yaml.
 api-types:
