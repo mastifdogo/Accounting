@@ -81,8 +81,20 @@ configuration and port:
 
 ### As a Proxmox LXC template
 
-To create containers from the Proxmox GUI, build a CT template with Ledger and
-PostgreSQL pre-installed (needs root and `apt install mmdebstrap zstd`):
+**Download a ready-made one:** every
+[GitHub Release](https://github.com/mastifdogo/Accounting/releases) has a
+Debian 12 CT template (`debian-12-ledger_<version>_amd64.tar.zst`) with Ledger
+and PostgreSQL pre-installed. On the Proxmox host:
+
+```sh
+wget -P /var/lib/vz/template/cache \
+  https://github.com/mastifdogo/Accounting/releases/download/<version>/debian-12-ledger_<version>_amd64.tar.zst
+```
+
+It then appears under **local → CT Templates**. Each release's notes include
+the exact URL and its SHA-256 checksum.
+
+**Or build it yourself** (needs root and `apt install mmdebstrap zstd`):
 
 ```sh
 make lxc-template                 # dist/debian-12-ledger_<version>_amd64.tar.zst
@@ -115,6 +127,20 @@ systemctl enable --now ledger ledger-backup.timer
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) explains every step, plus TrueNAS
 permissions, HTTPS behind a reverse proxy, backup/restore and troubleshooting.
 
+### Publishing a release
+
+Push a version tag. GitHub Actions (`.github/workflows/release.yml`) runs the
+unit and PostgreSQL integration tests, then builds the release tarball and the
+Debian 12 and Ubuntu 24.04 LXC templates, and attaches them with `SHA256SUMS`
+to a GitHub Release:
+
+```sh
+git tag v0.4.0 && git push origin v0.4.0
+```
+
+Or use **Actions → Release → Run workflow** and enter a tag. Tags with a
+suffix (`v0.5.0-rc.1`) are published as pre-releases.
+
 ## Layout
 
 ```
@@ -134,6 +160,7 @@ backend/handlers.go   HTTP handlers, error mapping, request safety
 frontend/             SvelteKit app; API types generated from api/openapi.yaml
 deploy/               proxmox-deploy.sh, install.sh, setup-db.sh, systemd units, backups
 deploy/lxc-template/  LXC template builder and first-boot provisioning
+.github/workflows/    release.yml: tests, builds and publishes releases + templates
 docs/DEPLOYMENT.md    Proxmox LXC + TrueNAS deployment guide
 ```
 

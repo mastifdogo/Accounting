@@ -66,8 +66,22 @@ troubleshooting.
 
 ## Alternative: a ready-made LXC template
 
-If you prefer the Proxmox GUI, or want to create several containers, build a
-**CT template** with Ledger and PostgreSQL already installed:
+If you prefer the Proxmox GUI, or want to create several containers, use a
+**CT template** with Ledger and PostgreSQL already installed.
+
+**Download it** from the [Releases page](https://github.com/mastifdogo/Accounting/releases).
+On the Proxmox host:
+
+```sh
+cd /var/lib/vz/template/cache
+wget https://github.com/mastifdogo/Accounting/releases/download/<version>/debian-12-ledger_<version>_amd64.tar.zst
+sha256sum debian-12-ledger_<version>_amd64.tar.zst     # compare with SHA256SUMS on the release
+```
+
+Releases are built by `.github/workflows/release.yml` whenever a `v*` tag is
+pushed. Skip to "Using it" below.
+
+**Or build it yourself:**
 
 ```sh
 apt install mmdebstrap zstd             # on any Debian/Ubuntu machine, or the Proxmox host
