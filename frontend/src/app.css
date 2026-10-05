@@ -288,3 +288,20 @@ tfoot td {
 	margin: 0.4rem 0 0;
 	padding-left: 1.2rem;
 }
+
+/* Printing reports: drop navigation and controls. */
+@media print {
+	header,
+	.toolbar,
+	.small a[href='/reports'] {
+		display: none !important;
+	}
+	body {
+		background: #fff;
+		color: #000;
+	}
+	.table-wrap,
+	.card {
+		border: none;
+	}
+}

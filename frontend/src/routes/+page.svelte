@@ -37,8 +37,8 @@
 	<div class="card">
 		<p><strong>Welcome!</strong> Start by creating your chart of accounts.</p>
 		<p>
-			Each account has one currency (CAD or USD). For CAD↔USD transfers, create an FX clearing account in
-			each currency.
+			Each account has one currency (CAD or USD). For CAD↔USD transfers, create an FX clearing account
+			(type <em>equity</em>, e.g. “Currency trading CAD/USD”) in each currency.
 		</p>
 		<a class="button" href="/accounts">Set up accounts →</a>
 	</div>

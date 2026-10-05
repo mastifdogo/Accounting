@@ -21,9 +21,14 @@ backend/accounts.go   Chart of accounts, account ledger, trial balance
 backend/export.go     General Ledger CSV export, CSV file listing/download
 backend/import.go     All-or-nothing CSV import of journal entries
 backend/upload.go     CSV upload (never overwrites)
+backend/auth.go       Users, bcrypt passwords, sessions, login rate limiting
+backend/reports.go    Balance sheet and income statement
+backend/cli.go        `ledger user add|passwd|disable|enable|list`
 backend/static.go     Serves the embedded frontend (backend/web) with SPA fallback
 backend/handlers.go   HTTP handlers, error mapping, request safety
 frontend/             SvelteKit app; API types generated from api/openapi.yaml
+deploy/               systemd units, install/DB setup scripts, backups
+docs/DEPLOYMENT.md    Proxmox LXC + TrueNAS deployment guide
 ```
 
 ## Accounting rules and where they are enforced
@@ -42,6 +47,8 @@ frontend/             SvelteKit app; API types generated from api/openapi.yaml
 | Corrections | `POST /journal-entries/{id}/reverse` | `UNIQUE (reverses_id)`: reversed once at most |
 | Inactive accounts | pre-check with `FOR SHARE` lock | `BEFORE INSERT` trigger |
 | CSV import all-or-nothing, never twice | one transaction per file | `UNIQUE (sha256)` on `csv_imports` |
+| Who posted what | session user recorded | `created_by` / `imported_by`; users can't be deleted |
+| App can't bypass the rules | — | app role owns nothing (see `db/grants.sql`) |
 
 Lines are stored as one signed `amount` (debit > 0, credit < 0). The API exposes
 separate `debit_cents` / `credit_cents`, and refers to accounts by `code`.
@@ -50,7 +57,8 @@ separate `debit_cents` / `credit_cents`, and refers to accounts by `code`.
 
 Each account has one currency (CAD or USD) and each journal entry must balance
 within every currency, so amounts are exact and no exchange rates are stored.
-Move value between currencies through an FX clearing account in each currency:
+Move value between currencies through an FX clearing account in each currency
+(type `equity`, so the balance sheet's assets show only real balances):
 
 | account              | debit   | credit  |
 |----------------------|---------|---------|
@@ -77,19 +85,40 @@ Optional columns: `reference`, `memo`, `currency`. Full rules are in
 
 ## Running
 
+**Production:** see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) (Proxmox LXC,
+TrueNAS bind mount, systemd, backups, HTTPS).
+
+**Locally:**
+
 ```sh
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/schema.sql
+createdb ledger && psql -d ledger -v ON_ERROR_STOP=1 -f db/schema.sql
 make build            # npm ci + vite build, then a static Go binary embedding it
-DATABASE_URL=postgres://ledger_app:...@db/ledger ./bin/ledger
+export DATABASE_URL=postgres://localhost/ledger
+./bin/ledger user add alice
+CSV_DIR=./csv ./bin/ledger      # http://localhost:8080
 ```
 
-Open `http://<container>:8080/`. The only runtime artifact is `bin/ledger`
-(~12 MB); Node is needed at build time only.
+| Variable        | Default          |
+|-----------------|------------------|
+| `DATABASE_URL`  | required         |
+| `HTTP_ADDR`     | `:8080`          |
+| `CSV_DIR`       | `/app/csv_data`  |
+| `DB_MAX_CONNS`  | `4`              |
+| `COOKIE_SECURE` | `auto`           |
 
-> **No login yet.** Anyone who can reach port 8080 can post entries. Keep it on
-> a trusted LAN/VPN or behind an authenticating reverse proxy until
-> authentication is added. Cross-site requests from other web pages are
-> already blocked (`Sec-Fetch-Site`/`Origin` checks, JSON-only bodies).
+### Authentication
+
+Users log in with a username and password (bcrypt) and get a server-side
+session in an HttpOnly, SameSite=Strict cookie. Sessions end after 8 hours idle
+or 7 days. Repeated failed logins are throttled. There's no sign-up page:
+users are managed with `ledger user …` on the server. Every journal entry and
+import records who posted it.
+
+### Reports
+
+Trial balance, balance sheet and income statement, each per currency. Net
+income that hasn't been closed to equity appears on the balance sheet as
+"Net income (unclosed)", so assets = liabilities + equity always holds.
 
 ### Frontend development
 

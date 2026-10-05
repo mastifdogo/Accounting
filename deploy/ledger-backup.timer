@@ -1,0 +1,11 @@
+# /etc/systemd/system/ledger-backup.timer
+[Unit]
+Description=Nightly Ledger database backup
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

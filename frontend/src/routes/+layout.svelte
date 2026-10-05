@@ -2,16 +2,24 @@
 	import '../app.css';
 	import favicon from '#lib/assets/favicon.svg';
 	import { page } from '$app/state';
+	import { goto, invalidateAll } from '$app/navigation';
+	import { api } from '#lib/api/client.ts';
 	import type { LayoutProps } from './$types';
 
-	let { children }: LayoutProps = $props();
+	let { children, data }: LayoutProps = $props();
+
+	async function logout() {
+		await api().POST('/auth/logout');
+		await invalidateAll();
+		await goto('/login');
+	}
 
 	const links = [
 		{ href: '/', label: 'Dashboard', exact: true },
 		{ href: '/journal', label: 'Journal', exact: true },
 		{ href: '/journal/new', label: 'New entry', exact: true },
 		{ href: '/accounts', label: 'Accounts', exact: false },
-		{ href: '/reports/trial-balance', label: 'Trial balance', exact: false },
+		{ href: '/reports', label: 'Reports', exact: false },
 		{ href: '/files', label: 'Files', exact: false }
 	];
 
@@ -27,14 +35,20 @@
 	<title>Ledger</title>
 </svelte:head>
 
-<header>
-	<nav aria-label="Main">
-		<a class="brand" href="/">Ledger</a>
-		{#each links as l (l.href)}
-			<a href={l.href} aria-current={active(l.href, l.exact) ? 'page' : undefined}>{l.label}</a>
-		{/each}
-	</nav>
-</header>
+{#if data.user}
+	<header>
+		<nav aria-label="Main">
+			<a class="brand" href="/">Ledger</a>
+			{#each links as l (l.href)}
+				<a href={l.href} aria-current={active(l.href, l.exact) ? 'page' : undefined}>{l.label}</a>
+			{/each}
+			<span class="user">
+				<a href="/settings" aria-current={active('/settings', true) ? 'page' : undefined} title="Account settings">{data.user.username}</a>
+				<button class="link" onclick={logout}>Log out</button>
+			</span>
+		</nav>
+	</header>
+{/if}
 
 <main>
 	{@render children()}
@@ -70,6 +84,12 @@
 	nav a[aria-current='page'] {
 		color: var(--text);
 		border-bottom-color: var(--accent);
+	}
+	.user {
+		margin-left: auto;
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
 	}
 	nav a.brand {
 		color: var(--text);

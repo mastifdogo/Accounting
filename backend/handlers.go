@@ -37,26 +37,14 @@ func (a *App) Routes() http.Handler {
 		r.Use(middleware.Timeout(60 * time.Second))
 
 		r.Get("/health", a.handleHealth)
-		r.Get("/currencies", a.handleListCurrencies)
+		r.Post("/auth/login", a.handleLogin)
+		r.Post("/auth/logout", a.handleLogout)
 
-		r.Get("/accounts", a.handleListAccounts)
-		r.Post("/accounts", a.handleCreateAccount)
-		r.Get("/accounts/{accountCode}", a.handleGetAccount)
-		r.Patch("/accounts/{accountCode}", a.handleUpdateAccount)
-		r.Get("/accounts/{accountCode}/ledger", a.handleAccountLedger)
-
-		r.Get("/journal-entries", a.handleListJournalEntries)
-		r.Post("/journal-entries", a.handleCreateJournalEntry)
-		r.Get("/journal-entries/{entryId}", a.handleGetJournalEntry)
-		r.Post("/journal-entries/{entryId}/reverse", a.handleReverseJournalEntry)
-
-		r.Get("/reports/trial-balance", a.handleTrialBalance)
-
-		r.Post("/exports/general-ledger", a.handleExportGeneralLedger)
-		r.Get("/files", a.handleListFiles)
-		r.Post("/files", a.handleUploadFile)
-		r.Get("/files/{filename}", a.handleDownloadFile)
-		r.Post("/imports/journal-entries", a.handleImportJournalEntries)
+		// Everything else requires a logged-in user.
+		r.Group(func(r chi.Router) {
+			r.Use(a.requireAuth)
+			a.protectedRoutes(r)
+		})
 
 		r.NotFound(func(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "not_found", "no such endpoint", nil)
@@ -71,6 +59,34 @@ func (a *App) Routes() http.Handler {
 	}))
 	r.Handle("/*", staticHandler())
 	return r
+}
+
+func (a *App) protectedRoutes(r chi.Router) {
+	r.Get("/auth/me", a.handleMe)
+	r.Post("/auth/password", a.handleChangePassword)
+	r.Get("/currencies", a.handleListCurrencies)
+
+	r.Get("/accounts", a.handleListAccounts)
+	r.Post("/accounts", a.handleCreateAccount)
+	r.Get("/accounts/{accountCode}", a.handleGetAccount)
+	r.Patch("/accounts/{accountCode}", a.handleUpdateAccount)
+	r.Get("/accounts/{accountCode}/ledger", a.handleAccountLedger)
+
+	r.Get("/journal-entries", a.handleListJournalEntries)
+	r.Post("/journal-entries", a.handleCreateJournalEntry)
+	r.Get("/journal-entries/{entryId}", a.handleGetJournalEntry)
+	r.Post("/journal-entries/{entryId}/reverse", a.handleReverseJournalEntry)
+
+	r.Get("/reports/trial-balance", a.handleTrialBalance)
+
+	r.Post("/exports/general-ledger", a.handleExportGeneralLedger)
+	r.Get("/files", a.handleListFiles)
+	r.Post("/files", a.handleUploadFile)
+	r.Get("/files/{filename}", a.handleDownloadFile)
+	r.Post("/imports/journal-entries", a.handleImportJournalEntries)
+
+	r.Get("/reports/balance-sheet", a.handleBalanceSheet)
+	r.Get("/reports/income-statement", a.handleIncomeStatement)
 }
 
 func securityHeaders(next http.Handler) http.Handler {
@@ -525,6 +541,12 @@ func writeErr(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.As(err, &ve):
 		writeError(w, http.StatusUnprocessableEntity, "validation_failed", "request validation failed", ve.Details)
+	case errors.Is(err, ErrUnauthorized):
+		writeError(w, http.StatusUnauthorized, "unauthorized", "login required", nil)
+	case errors.Is(err, ErrBadCredentials):
+		writeError(w, http.StatusUnauthorized, "unauthorized", ErrBadCredentials.Error(), nil)
+	case errors.Is(err, ErrTooManyLogins):
+		writeError(w, http.StatusTooManyRequests, "too_many_requests", ErrTooManyLogins.Error(), nil)
 	case errors.Is(err, ErrTooLarge):
 		writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large",
 			fmt.Sprintf("file is larger than %d bytes", maxUploadBytes), nil)

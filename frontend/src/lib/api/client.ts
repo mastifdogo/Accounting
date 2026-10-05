@@ -3,7 +3,8 @@
 // published contract, never on backend internals.
 
 import createClient from 'openapi-fetch';
-import { error as kitError } from '@sveltejs/kit';
+import { error as kitError, redirect } from '@sveltejs/kit';
+import { goto } from '$app/navigation';
 import type { components, paths } from './schema';
 
 export type Schemas = components['schemas'];
@@ -16,6 +17,10 @@ export type TrialBalance = Schemas['TrialBalance'];
 export type CsvFile = Schemas['CsvFile'];
 export type ImportResult = Schemas['ImportResult'];
 export type ApiErrorBody = Schemas['Error']['error'];
+export type User = Schemas['User'];
+export type BalanceSheet = Schemas['BalanceSheet'];
+export type IncomeStatement = Schemas['IncomeStatement'];
+export type ReportLine = Schemas['ReportLine'];
 
 export const API_BASE = '/api/v1';
 export const ACCOUNT_TYPES: AccountType[] = ['asset', 'liability', 'equity', 'revenue', 'expense'];
@@ -48,9 +53,24 @@ function toApiError(res: Result<unknown>): ApiError {
 	return new ApiError(res.response.status, body ?? { code: 'internal_error', message: res.response.statusText || 'Request failed' });
 }
 
+/** The login page URL that returns to the current page afterwards. */
+export function loginUrl(): string {
+	const here = location.pathname + location.search;
+	return here.startsWith('/login') ? '/login' : `/login?next=${encodeURIComponent(here)}`;
+}
+
+/** After a 401 (expired session) outside the login page, go log in again. */
+function onUnauthorized() {
+	if (!location.pathname.startsWith('/login')) goto(loginUrl());
+}
+
 /** Returns the response data or throws an ApiError (for use in event handlers). */
 export function unwrap<T>(res: Result<T>): T {
-	if (res.error !== undefined || res.data === undefined) throw toApiError(res);
+	if (res.error !== undefined || res.data === undefined) {
+		const e = toApiError(res);
+		if (e.status === 401) onUnauthorized();
+		throw e;
+	}
 	return res.data;
 }
 
@@ -58,6 +78,7 @@ export function unwrap<T>(res: Result<T>): T {
 export function unwrapLoad<T>(res: Result<T>): T {
 	if (res.error !== undefined || res.data === undefined) {
 		const e = toApiError(res);
+		if (e.status === 401) redirect(307, loginUrl());
 		kitError(e.status, e.message);
 	}
 	return res.data as T;
@@ -70,6 +91,7 @@ export async function uploadCsv(file: File): Promise<CsvFile> {
 	const response = await fetch(`${API_BASE}/files`, { method: 'POST', body: form });
 	const body = await response.json().catch(() => undefined);
 	if (!response.ok) {
+		if (response.status === 401) onUnauthorized();
 		throw new ApiError(response.status, body?.error ?? { code: 'internal_error', message: response.statusText });
 	}
 	return body as CsvFile;

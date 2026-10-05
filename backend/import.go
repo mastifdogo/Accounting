@@ -115,9 +115,9 @@ func (a *App) ImportJournalEntries(ctx context.Context, filename string) (*Impor
 
 	var importID int64
 	err = tx.QueryRow(ctx, `
-		INSERT INTO csv_imports (filename, sha256, entry_count, line_count)
-		VALUES ($1, $2, $3, $4) RETURNING id`,
-		filename, digest, len(groups), lineCount).Scan(&importID)
+		INSERT INTO csv_imports (filename, sha256, entry_count, line_count, imported_by)
+		VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+		filename, digest, len(groups), lineCount, actorID(ctx)).Scan(&importID)
 	if err != nil {
 		return nil, fmt.Errorf("record import: %w", err)
 	}

@@ -4,3 +4,4 @@
 .env
 /backend/web/*
 !/backend/web/.gitkeep
+/dist/

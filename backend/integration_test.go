@@ -73,8 +73,21 @@ func setupTestApp(t *testing.T) (*App, http.Handler) {
 		t.Fatalf("apply schema: %v", err)
 	}
 
-	app := &App{DB: pool, CSVDir: t.TempDir()}
-	return app, app.Routes()
+	app := NewApp(pool, Config{CSVDir: t.TempDir(), CookieSecure: "auto"})
+	if _, err := app.CreateUser(ctx, "tester", "correct horse battery"); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	_, token, err := app.Login(ctx, "tester", "correct horse battery")
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	// Every request through the returned handler carries the session cookie.
+	routes := app.Routes()
+	authed := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.AddCookie(&http.Cookie{Name: sessionCookie, Value: token})
+		routes.ServeHTTP(w, r)
+	})
+	return app, authed
 }
 
 type apiResp struct {
@@ -619,4 +632,229 @@ func TestUploadAndRequestSafety(t *testing.T) {
 			t.Errorf("GET %s: missing security headers", path)
 		}
 	}
+}
+
+func rawCall(t *testing.T, h http.Handler, method, path, body string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, "/api/v1"+path, strings.NewReader(body))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func sessionFrom(t *testing.T, rec *httptest.ResponseRecorder) *http.Cookie {
+	t.Helper()
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == sessionCookie {
+			return c
+		}
+	}
+	t.Fatalf("no session cookie in response (status %d: %s)", rec.Code, rec.Body.String())
+	return nil
+}
+
+func TestAuthentication(t *testing.T) {
+	app, _ := setupTestApp(t)
+	h := app.Routes() // no automatic cookie
+	ctx := context.Background()
+
+	// Health is public; everything else needs a session.
+	if rec := rawCall(t, h, "GET", "/health", ""); rec.Code != 200 {
+		t.Fatalf("health = %d", rec.Code)
+	}
+	for _, p := range []string{"/accounts", "/journal-entries", "/files", "/auth/me", "/reports/balance-sheet"} {
+		rec := rawCall(t, h, "GET", p, "")
+		if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), `"unauthorized"`) {
+			t.Errorf("GET %s without session = %d %s", p, rec.Code, rec.Body.String())
+		}
+	}
+	if rec := rawCall(t, h, "GET", "/accounts", "", &http.Cookie{Name: sessionCookie, Value: "forged"}); rec.Code != 401 {
+		t.Fatalf("forged cookie accepted: %d", rec.Code)
+	}
+
+	// Bad credentials, including an unknown user, get the same vague 401.
+	for _, body := range []string{`{"username":"tester","password":"wrong password!"}`, `{"username":"nobody","password":"whatever12345"}`} {
+		rec := rawCall(t, h, "POST", "/auth/login", body)
+		if rec.Code != 401 || !strings.Contains(rec.Body.String(), "invalid username or password") {
+			t.Fatalf("bad login = %d %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	// Good login: hardened cookie, and the session works.
+	rec := rawCall(t, h, "POST", "/auth/login", `{"username":"  Tester ","password":"correct horse battery"}`)
+	if rec.Code != 200 {
+		t.Fatalf("login = %d %s", rec.Code, rec.Body.String())
+	}
+	c := sessionFrom(t, rec)
+	if !c.HttpOnly || c.SameSite != http.SameSiteStrictMode || c.Secure || c.Path != "/" {
+		t.Fatalf("cookie flags: %+v", c)
+	}
+	if rec := rawCall(t, h, "GET", "/auth/me", "", c); rec.Code != 200 || !strings.Contains(rec.Body.String(), `"username":"tester"`) {
+		t.Fatalf("me = %d %s", rec.Code, rec.Body.String())
+	}
+	// Secure flag when behind a TLS-terminating proxy.
+	req := httptest.NewRequest("POST", "/api/v1/auth/login", strings.NewReader(`{"username":"tester","password":"correct horse battery"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req)
+	if !sessionFrom(t, rec2).Secure {
+		t.Fatal("expected Secure cookie behind https proxy")
+	}
+	other := sessionFrom(t, rec2)
+
+	// Audit trail: entries record who posted them.
+	createAccount(t, withCookie(h, c), "1000", "Bank CAD", AccountAsset, CurrencyCAD)
+	createAccount(t, withCookie(h, c), "4000", "Sales", AccountRevenue, CurrencyCAD)
+	r := call(t, withCookie(h, c), "POST", "/journal-entries", entry("2026-10-01", "Sale", dr("1000", 100), cr("4000", 100)))
+	expectStatus(t, r, http.StatusCreated)
+	var e JournalEntry
+	r.decode(t, &e)
+	if e.CreatedBy == nil || *e.CreatedBy != "tester" {
+		t.Fatalf("created_by = %v", e.CreatedBy)
+	}
+
+	// Password change: validates, keeps this session, ends the others.
+	if rec := rawCall(t, h, "POST", "/auth/password", `{"current_password":"nope","new_password":"short"}`, c); rec.Code != 422 {
+		t.Fatalf("bad password change = %d", rec.Code)
+	}
+	if rec := rawCall(t, h, "POST", "/auth/password", `{"current_password":"correct horse battery","new_password":"a much better passphrase"}`, c); rec.Code != 204 {
+		t.Fatalf("password change = %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := rawCall(t, h, "GET", "/auth/me", "", c); rec.Code != 200 {
+		t.Fatal("current session should survive a password change")
+	}
+	if rec := rawCall(t, h, "GET", "/auth/me", "", other); rec.Code != 401 {
+		t.Fatal("other sessions should end after a password change")
+	}
+
+	// Logout ends the session server-side.
+	if rec := rawCall(t, h, "POST", "/auth/logout", "", c); rec.Code != 204 {
+		t.Fatalf("logout = %d", rec.Code)
+	}
+	if rec := rawCall(t, h, "GET", "/auth/me", "", c); rec.Code != 401 {
+		t.Fatal("session still valid after logout")
+	}
+
+	// Disabled users cannot log in and lose existing sessions.
+	c = sessionFrom(t, rawCall(t, h, "POST", "/auth/login", `{"username":"tester","password":"a much better passphrase"}`))
+	if err := app.SetUserActive(ctx, "tester", false); err != nil {
+		t.Fatal(err)
+	}
+	if rec := rawCall(t, h, "GET", "/auth/me", "", c); rec.Code != 401 {
+		t.Fatal("disabled user's session still valid")
+	}
+	if rec := rawCall(t, h, "POST", "/auth/login", `{"username":"tester","password":"a much better passphrase"}`); rec.Code != 401 {
+		t.Fatal("disabled user could log in")
+	}
+	if err := app.SetUserActive(ctx, "tester", true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Users can't be deleted (audit trail), and passwords are not stored in clear.
+	if _, err := app.DB.Exec(ctx, `DELETE FROM users`); err == nil {
+		t.Fatal("users must not be deletable")
+	}
+	var hash string
+	app.DB.QueryRow(ctx, `SELECT password_hash FROM users WHERE username = 'tester'`).Scan(&hash)
+	if !strings.HasPrefix(hash, "$2") {
+		t.Fatalf("password not bcrypt-hashed: %q", hash)
+	}
+
+	// Validation of new users.
+	if _, err := app.CreateUser(ctx, "Bad Name!", "long enough password"); err == nil {
+		t.Fatal("invalid username accepted")
+	}
+	if _, err := app.CreateUser(ctx, "bob", "short"); err == nil {
+		t.Fatal("short password accepted")
+	}
+
+	// Rate limiting: after repeated failures even the right password is refused.
+	for i := 0; i < loginMaxFailures; i++ {
+		rawCall(t, h, "POST", "/auth/login", `{"username":"tester","password":"wrong wrong wrong"}`)
+	}
+	if rec := rawCall(t, h, "POST", "/auth/login", `{"username":"tester","password":"a much better passphrase"}`); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 after %d failures, got %d", loginMaxFailures, rec.Code)
+	}
+}
+
+func withCookie(h http.Handler, c *http.Cookie) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.AddCookie(c)
+		h.ServeHTTP(w, r)
+	})
+}
+
+func TestFinancialStatements(t *testing.T) {
+	_, h := setupTestApp(t)
+	createAccount(t, h, "1000", "Bank CAD", AccountAsset, CurrencyCAD)
+	createAccount(t, h, "1010", "Bank USD", AccountAsset, CurrencyUSD)
+	createAccount(t, h, "1900", "FX clearing CAD", AccountAsset, CurrencyCAD)
+	createAccount(t, h, "1910", "FX clearing USD", AccountLiability, CurrencyUSD)
+	createAccount(t, h, "2000", "Credit card", AccountLiability, CurrencyCAD)
+	createAccount(t, h, "3000", "Owner equity", AccountEquity, CurrencyCAD)
+	createAccount(t, h, "4000", "Sales", AccountRevenue, CurrencyCAD)
+	createAccount(t, h, "4010", "Sales USD", AccountRevenue, CurrencyUSD)
+	createAccount(t, h, "6100", "Supplies", AccountExpense, CurrencyCAD)
+
+	post := func(date string, lines ...JournalLineCreate) {
+		t.Helper()
+		expectStatus(t, call(t, h, "POST", "/journal-entries", entry(date, "x", lines...)), http.StatusCreated)
+	}
+	post("2025-12-15", dr("1000", 1000000), cr("3000", 1000000))                                   // capital 10,000
+	post("2025-12-20", dr("1000", 50000), cr("4000", 50000))                                       // 2025 sale 500
+	post("2026-02-01", dr("1000", 120000), cr("4000", 120000))                                     // 2026 sale 1,200
+	post("2026-03-01", dr("6100", 30000), cr("2000", 30000))                                       // supplies on card 300
+	post("2026-04-01", dr("1010", 80000), cr("4010", 80000))                                       // USD sale 800
+	post("2026-05-01", dr("1900", 13700), cr("1000", 13700), dr("1910", 10000), cr("1010", 10000)) // swap
+
+	r := call(t, h, "GET", "/reports/balance-sheet?as_of=2026-12-31", nil)
+	expectStatus(t, r, http.StatusOK)
+	var bs BalanceSheet
+	r.decode(t, &bs)
+	if len(bs.Currencies) != 2 {
+		t.Fatalf("currencies: %+v", bs)
+	}
+	cad, usd := bs.Currencies[0], bs.Currencies[1]
+	// CAD assets: bank 10000+500+1200-137 = 11563; clearing 137 => 11700.
+	// Liabilities: card 300. Equity 10000 + net income (500+1200-300=1400) = 11400.
+	if cad.Currency != CurrencyCAD || cad.TotalAssetsCents != 1170000 || cad.TotalLiabilitiesCents != 30000 ||
+		cad.NetIncomeCents != 140000 || cad.TotalEquityCents != 1140000 || !cad.Balanced {
+		t.Fatalf("CAD balance sheet: %+v", cad)
+	}
+	// USD: bank 800-100 = 700; clearing (a liability here) shows -100; equity = net income 800.
+	if usd.TotalAssetsCents != 70000 || usd.TotalLiabilitiesCents != -10000 || usd.TotalEquityCents != 80000 || !usd.Balanced {
+		t.Fatalf("USD balance sheet: %+v", usd)
+	}
+
+	// Balance sheet as of an earlier date.
+	r = call(t, h, "GET", "/reports/balance-sheet?as_of=2025-12-31&currency=CAD", nil)
+	r.decode(t, &bs)
+	if len(bs.Currencies) != 1 || bs.Currencies[0].TotalAssetsCents != 1050000 || bs.Currencies[0].NetIncomeCents != 50000 {
+		t.Fatalf("2025 balance sheet: %+v", bs)
+	}
+
+	// Income statement for 2026 only.
+	r = call(t, h, "GET", "/reports/income-statement?from=2026-01-01&to=2026-12-31", nil)
+	expectStatus(t, r, http.StatusOK)
+	var is IncomeStatement
+	r.decode(t, &is)
+	if len(is.Currencies) != 2 {
+		t.Fatalf("income statement: %+v", is)
+	}
+	c := is.Currencies[0]
+	if c.TotalRevenueCents != 120000 || c.TotalExpensesCents != 30000 || c.NetIncomeCents != 90000 ||
+		len(c.Revenue) != 1 || c.Revenue[0].AccountCode != "4000" || len(c.Expenses) != 1 {
+		t.Fatalf("CAD income statement: %+v", c)
+	}
+	if u := is.Currencies[1]; u.Currency != CurrencyUSD || u.NetIncomeCents != 80000 {
+		t.Fatalf("USD income statement: %+v", u)
+	}
+	expectStatus(t, call(t, h, "GET", "/reports/income-statement?from=2026-02-01&to=2026-01-01", nil), http.StatusUnprocessableEntity)
 }

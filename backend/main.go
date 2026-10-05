@@ -10,6 +10,17 @@
 //	HTTP_ADDR     listen address               (default ":8080")
 //	CSV_DIR       CSV import/export directory  (default "/app/csv_data")
 //	DB_MAX_CONNS  connection pool size         (default 4)
+//	COOKIE_SECURE session cookie Secure flag: auto | true | false (default auto)
+//
+// User management (same environment):
+//
+//	ledger user add <name>      create a user (prompts for a password)
+//	ledger user passwd <name>   set a new password (ends their sessions)
+//	ledger user disable <name>  block logins (ends their sessions)
+//	ledger user enable <name>
+//	ledger user list
+//
+// Pass --password-stdin to add/passwd to read the password from stdin.
 package main
 
 import (
@@ -34,21 +45,28 @@ import (
 // ---------------------------------------------------------------------------
 
 type Config struct {
-	DatabaseURL string
-	HTTPAddr    string
-	CSVDir      string
-	DBMaxConns  int32
+	DatabaseURL  string
+	HTTPAddr     string
+	CSVDir       string
+	DBMaxConns   int32
+	CookieSecure string
 }
 
 func loadConfig() (Config, error) {
 	cfg := Config{
-		DatabaseURL: os.Getenv("DATABASE_URL"),
-		HTTPAddr:    envOr("HTTP_ADDR", ":8080"),
-		CSVDir:      envOr("CSV_DIR", "/app/csv_data"),
-		DBMaxConns:  4,
+		DatabaseURL:  os.Getenv("DATABASE_URL"),
+		HTTPAddr:     envOr("HTTP_ADDR", ":8080"),
+		CSVDir:       envOr("CSV_DIR", "/app/csv_data"),
+		DBMaxConns:   4,
+		CookieSecure: envOr("COOKIE_SECURE", "auto"),
 	}
 	if cfg.DatabaseURL == "" {
 		return cfg, errors.New("DATABASE_URL is required")
+	}
+	switch cfg.CookieSecure {
+	case "auto", "true", "false":
+	default:
+		return cfg, fmt.Errorf("COOKIE_SECURE must be auto, true or false, got %q", cfg.CookieSecure)
 	}
 	if v := os.Getenv("DB_MAX_CONNS"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 32)
@@ -99,6 +117,13 @@ func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(log)
 
+	if len(os.Args) > 1 && os.Args[1] == "user" {
+		if err := runUserCommand(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		log.Error("fatal", "err", err)
 		os.Exit(1)
@@ -124,7 +149,11 @@ func run() error {
 		slog.Warn("CSV directory is not available; exports will fail", "dir", cfg.CSVDir, "err", err)
 	}
 
-	app := &App{DB: pool, CSVDir: cfg.CSVDir}
+	app := NewApp(pool, cfg)
+	var users int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE is_active`).Scan(&users); err == nil && users == 0 {
+		slog.Warn("no active users: create one with `ledger user add <name>` to log in")
+	}
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           app.Routes(),
@@ -156,8 +185,14 @@ func run() error {
 
 // App holds shared dependencies for handlers and ledger operations.
 type App struct {
-	DB     *pgxpool.Pool
-	CSVDir string
+	DB           *pgxpool.Pool
+	CSVDir       string
+	CookieSecure string
+	logins       *loginLimiter
+}
+
+func NewApp(pool *pgxpool.Pool, cfg Config) *App {
+	return &App{DB: pool, CSVDir: cfg.CSVDir, CookieSecure: cfg.CookieSecure, logins: newLoginLimiter()}
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +310,7 @@ type JournalEntry struct {
 	ReversesID   *int64          `json:"reverses_id"`
 	ReversedByID *int64          `json:"reversed_by_id"`
 	ImportID     *int64          `json:"import_id"`
+	CreatedBy    *string         `json:"created_by"`
 	PostedAt     time.Time       `json:"posted_at"`
 	Totals       []CurrencyTotal `json:"totals"`
 	Lines        []JournalLine   `json:"lines"`

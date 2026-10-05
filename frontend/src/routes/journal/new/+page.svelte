@@ -171,7 +171,7 @@
 		<button class="primary" disabled={!ready || saving}>{saving ? 'Posting…' : 'Post entry'}</button>
 	</div>
 	<p class="muted small">
-		Each currency must balance on its own. For CAD↔USD transfers, post through an FX clearing account in each currency.
+		Each currency must balance on its own. For CAD↔USD transfers, post through an FX clearing (equity) account in each currency.
 		Posted entries cannot be edited; corrections are made with a reversing entry.
 	</p>
 </form>

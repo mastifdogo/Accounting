@@ -4,6 +4,74 @@
  */
 
 export interface paths {
+    "/auth/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Log in and receive a session cookie */
+        post: operations["login"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** End the current session */
+        post: operations["logout"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The logged-in user */
+        get: operations["getCurrentUser"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/password": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Change your own password (ends your other sessions) */
+        post: operations["changePassword"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/health": {
         parameters: {
             query?: never;
@@ -180,6 +248,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/reports/balance-sheet": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Assets, liabilities and equity as of a date, per currency
+         * @description Amounts use each account's natural sign. Revenue minus expenses to
+         *     date (not yet closed to an equity account) is reported as
+         *     `net_income_cents` and included in total equity, so
+         *     assets = liabilities + equity.
+         */
+        get: operations["getBalanceSheet"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/reports/income-statement": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Revenue, expenses and net income for a period, per currency */
+        get: operations["getIncomeStatement"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/exports/general-ledger": {
         parameters: {
             query?: never;
@@ -326,6 +434,68 @@ export interface components {
             amount_cents: components["schemas"]["Cents"];
         };
         CsvFilename: string;
+        User: {
+            /** @example alice */
+            username: string;
+            is_active: boolean;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            last_login_at: string | null;
+        };
+        LoginRequest: {
+            /** @description Case-insensitive */
+            username: string;
+            /** Format: password */
+            password: string;
+        };
+        PasswordChange: {
+            /** Format: password */
+            current_password: string;
+            /**
+             * Format: password
+             * @description 10+ characters, at most 72 bytes
+             */
+            new_password: string;
+        };
+        ReportLine: {
+            account_code: components["schemas"]["AccountCode"];
+            account_name: string;
+            /** @description Natural-sign balance (a contra balance is negative) */
+            amount_cents: components["schemas"]["SignedCents"];
+        };
+        BalanceSheet: {
+            /** Format: date */
+            as_of: string;
+            currencies: {
+                currency: components["schemas"]["Currency"];
+                assets: components["schemas"]["ReportLine"][];
+                liabilities: components["schemas"]["ReportLine"][];
+                equity: components["schemas"]["ReportLine"][];
+                /** @description Revenue minus expenses to date, not yet closed to equity */
+                net_income_cents: components["schemas"]["SignedCents"];
+                total_assets_cents: components["schemas"]["SignedCents"];
+                total_liabilities_cents: components["schemas"]["SignedCents"];
+                /** @description Equity accounts plus net income */
+                total_equity_cents: components["schemas"]["SignedCents"];
+                /** @description assets = liabilities + equity */
+                balanced: boolean;
+            }[];
+        };
+        IncomeStatement: {
+            /** Format: date */
+            from: string;
+            /** Format: date */
+            to: string;
+            currencies: {
+                currency: components["schemas"]["Currency"];
+                revenue: components["schemas"]["ReportLine"][];
+                expenses: components["schemas"]["ReportLine"][];
+                total_revenue_cents: components["schemas"]["SignedCents"];
+                total_expenses_cents: components["schemas"]["SignedCents"];
+                net_income_cents: components["schemas"]["SignedCents"];
+            }[];
+        };
         Health: {
             /** @enum {string} */
             status: "ok" | "degraded";
@@ -338,7 +508,7 @@ export interface components {
                  * @description Stable machine-readable code
                  * @enum {string}
                  */
-                code: "bad_request" | "validation_failed" | "not_found" | "conflict" | "forbidden" | "payload_too_large" | "internal_error";
+                code: "bad_request" | "validation_failed" | "not_found" | "conflict" | "unauthorized" | "forbidden" | "payload_too_large" | "too_many_requests" | "internal_error";
                 message: string;
                 details?: {
                     /**
@@ -430,6 +600,8 @@ export interface components {
              * @description Set when the entry was created by a CSV import
              */
             import_id: number | null;
+            /** @description Username of the person who posted the entry */
+            created_by: string | null;
             /** Format: date-time */
             posted_at: string;
             /** @description Per-currency sum of debits (always equal to the sum of credits), ordered by currency */
@@ -540,6 +712,100 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    login: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LoginRequest"];
+            };
+        };
+        responses: {
+            /** @description Logged in; `Set-Cookie` carries the session */
+            200: {
+                headers: {
+                    "Set-Cookie"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["User"];
+                };
+            };
+            401: components["responses"]["Error"];
+            429: components["responses"]["Error"];
+            default: components["responses"]["Error"];
+        };
+    };
+    logout: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Logged out (cookie cleared) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    getCurrentUser: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current user */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["User"];
+                };
+            };
+            401: components["responses"]["Error"];
+            default: components["responses"]["Error"];
+        };
+    };
+    changePassword: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PasswordChange"];
+            };
+        };
+        responses: {
+            /** @description Password changed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Error"];
+            422: components["responses"]["Error"];
+            default: components["responses"]["Error"];
+        };
+    };
     getHealth: {
         parameters: {
             query?: never;
@@ -882,6 +1148,59 @@ export interface operations {
                     "application/json": components["schemas"]["TrialBalance"];
                 };
             };
+            default: components["responses"]["Error"];
+        };
+    };
+    getBalanceSheet: {
+        parameters: {
+            query?: {
+                /** @description Include entries dated on or before this day (default today) */
+                as_of?: string;
+                currency?: components["schemas"]["Currency"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Balance sheet */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BalanceSheet"];
+                };
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    getIncomeStatement: {
+        parameters: {
+            query?: {
+                /** @description Inclusive start date (default January 1 of the `to` year) */
+                from?: string;
+                /** @description Inclusive end date (default today) */
+                to?: string;
+                currency?: components["schemas"]["Currency"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Income statement */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IncomeStatement"];
+                };
+            };
+            422: components["responses"]["Error"];
             default: components["responses"]["Error"];
         };
     };
