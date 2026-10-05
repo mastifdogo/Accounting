@@ -100,3 +100,6 @@ make test-integration TEST_DATABASE_URL=postgres://postgres@localhost/postgres
 The integration tests create a throwaway database, apply `db/schema.sql`, test
 the API end to end (including direct SQL attempts to bypass the rules), and
 drop the database afterwards.
+
+tar xzf ledger-<version>-linux-amd64.tar.gz && cd ledger-<version>-linux-amd64
+./deploy/proxmox-deploy.sh --csv-path /mnt/pve/truenas/ledger
