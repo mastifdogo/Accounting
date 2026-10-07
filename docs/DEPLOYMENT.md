@@ -6,7 +6,7 @@ container, with CSV files and nightly database backups on a TrueNAS share.
 ```
 Proxmox host
  └─ LXC "ledger" (Debian 12, 1 core, 512 MB)
-     ├─ ledger.service        :8080   (single static binary, ~15–30 MB RAM)
+     ├─ ledger.service        :8080   (Node.js, ~60–90 MB RAM)
      ├─ postgresql             localhost only
      └─ /app/csv_data  ◄── bind mount ── TrueNAS dataset (CSV files + backups/)
 ```
@@ -15,7 +15,8 @@ What runs where:
 
 | Path | Contents |
 |------|----------|
-| `/usr/local/bin/ledger` | the server (UI embedded) and the `ledger user` CLI |
+| `/usr/local/bin/ledger` | launcher for the server and the `ledger user` CLI |
+| `/usr/local/lib/ledger/` | the server (`ledger.mjs`), the web UI (`web/`) and its Node.js runtime (`node`) |
 | `/usr/local/sbin/ledger-user` | root wrapper: runs `ledger user …` with the service config |
 | `/usr/local/bin/ledger-backup` | nightly `pg_dump` (run by `ledger-backup.timer`) |
 | `/etc/ledger/ledger.env` | configuration, including the DB password (root:ledger, 0640) |
@@ -86,7 +87,7 @@ pushed. Skip to "Using it" below.
 ```sh
 apt install mmdebstrap zstd             # on any Debian/Ubuntu machine, or the Proxmox host
 make lxc-template                       # dist/debian-12-ledger_<version>_amd64.tar.zst
-make lxc-template SUITE=noble           # Ubuntu 24.04 instead; also trixie, jammy; GOARCH=arm64
+make lxc-template SUITE=noble           # Ubuntu 24.04 instead; also trixie, jammy; ARCH=arm64
 # from an existing release, without the source tree:
 deploy/lxc-template/build-lxc-template.sh --release ledger-<version>-linux-amd64.tar.gz
 ```
@@ -140,15 +141,18 @@ To upgrade a container created from a template, use
 
 ## 1. Build a release (on your workstation)
 
-Requires Go 1.25+ and Node.js 22.
+Or download `ledger-<version>-linux-amd64.tar.gz` from a GitHub Release.
+Building requires Node.js 22.18+ and `curl`.
 
 ```sh
 make release                 # dist/ledger-<version>-linux-amd64.tar.gz
-make release GOARCH=arm64    # for an ARM host
+make release ARCH=arm64      # for an ARM host
 ```
 
-The tarball contains the binary, SQL files, `deploy/` scripts and these docs.
-Node is not needed on the server.
+The tarball contains the launcher, the bundled server and web UI, the official
+Node.js runtime for that architecture (checksum-verified at build time), SQL
+files, `deploy/` scripts and these docs. Nothing else needs to be installed on
+the server: the system's own `node` package (if any) is not used.
 
 ## 2. Create the container (Proxmox host shell)
 
@@ -327,9 +331,14 @@ Build a new release and copy it into the container, then:
 
 ```sh
 tar xzf ledger-<new>.tar.gz && cd ledger-<new>/
-sh deploy/install.sh                 # replaces binary, scripts and units; keeps ledger.env
+sh deploy/install.sh                 # replaces the program, scripts and units; keeps ledger.env
 systemctl restart ledger
 ```
+
+Upgrading from 0.4.x (the Go version) works the same way: the database,
+users, passwords and sessions carry over unchanged, and `GOMEMLIMIT` in
+`ledger.env` is simply ignored. Optionally add `LEDGER_MAX_HEAP_MB=96` there
+(the default) to make the heap limit explicit.
 
 If a release changes the database schema, its notes include a migration to
 run as `ledger_owner` before restarting. Release 0.x ships the baseline
@@ -346,12 +355,17 @@ schema only.
 | Log in works but you're logged out immediately behind a proxy | The proxy serves HTTPS but doesn't send `X-Forwarded-Proto`, or `COOKIE_SECURE=true` is set while you browse over plain HTTP. |
 | "cross-origin request rejected" (403) behind a proxy | The proxy rewrites `Host`. Pass the original host through. |
 | Forgot the only password | `ledger-user passwd <name>` as root in the container. |
+| `JavaScript heap out of memory` in the log | Raise `LEDGER_MAX_HEAP_MB` in `ledger.env` (keep it well below `MemoryMax=256M`) and restart. |
 
 Logs: `journalctl -u ledger -f` (JSON lines, one per request).
 
 ## Resource use
 
-Measured: the server peaks at about 16 MB RSS after a full workflow (accounts,
-entries, CSV import/export, reports). It runs with `MemoryMax=256M` and
-`GOMEMLIMIT=160MiB`. PostgreSQL with `postgresql-lowmem.conf` uses about
-100–150 MB, so 512 MB of RAM covers the whole container with room to spare.
+Measured: the server uses about 65–75 MB RSS idle and around 80 MB after a
+full workflow (accounts, entries, CSV import/export, reports). The heaviest
+case tested, a 10 MB / 50,000-row import running alongside three
+100,000-line account ledgers and a General Ledger export, peaked at about
+235 MB. It runs with `MemoryMax=256M` and a 96 MB JavaScript heap limit
+(`LEDGER_MAX_HEAP_MB`). PostgreSQL with `postgresql-lowmem.conf` uses about
+100–150 MB, so 512 MB of RAM covers the whole container. The program takes
+about 130 MB of disk, most of it the Node.js runtime.

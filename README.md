@@ -6,9 +6,9 @@ Lightweight double-entry accounting web app, sized for a low-resource Proxmox LX
 
 | Layer    | Tech                                                             |
 |----------|------------------------------------------------------------------|
-| Backend  | Go, single static binary (`CGO_ENABLED=0`), `chi` router, `pgx`  |
+| Backend  | Node.js 24 (TypeScript), `node:http`, `pg`, bundled to one file  |
 | Database | PostgreSQL 13+                                                   |
-| Frontend | SvelteKit 3 SPA (`adapter-static`), embedded in the Go binary    |
+| Frontend | SvelteKit 3 SPA (`adapter-static`), served by the backend        |
 | Files    | CSV import/export in `/app/csv_data` (TrueNAS bind mount)        |
 | Contract | [`api/openapi.yaml`](api/openapi.yaml)                           |
 
@@ -19,11 +19,15 @@ Lightweight double-entry accounting web app, sized for a low-resource Proxmox LX
 `deploy/proxmox-deploy.sh` runs on the **Proxmox host** as root. It creates the
 LXC container and installs everything inside it.
 
-1. Build a release on a machine with Go 1.25+ and Node.js 22:
+1. Download `ledger-<version>-linux-amd64.tar.gz` from a
+   [GitHub Release](https://github.com/mastifdogo/Accounting/releases), or build
+   one on a machine with Node.js 22.18+:
 
    ```sh
-   make release        # dist/ledger-<version>-linux-amd64.tar.gz  (GOARCH=arm64 for ARM)
+   make release        # dist/ledger-<version>-linux-amd64.tar.gz  (ARCH=arm64 for ARM)
    ```
+
+   The tarball includes the Node.js runtime, so nothing else needs installing.
 
 2. Copy the tarball to the Proxmox host, unpack it and run the script, pointing
    `--csv-path` at a directory on your TrueNAS mount:
@@ -100,7 +104,7 @@ the exact URL and its SHA-256 checksum.
 
 ```sh
 make lxc-template                 # dist/debian-12-ledger_<version>_amd64.tar.zst
-make lxc-template SUITE=noble     # Ubuntu 24.04 (also trixie, jammy; GOARCH=arm64)
+make lxc-template SUITE=noble     # Ubuntu 24.04 (also trixie, jammy; ARCH=arm64)
 ```
 
 Upload it under **CT Templates**, create an unprivileged container with
@@ -118,7 +122,7 @@ the unpacked release:
 
 ```sh
 apt install -y postgresql
-sh deploy/install.sh                                  # user, binary, systemd units, /etc/ledger/ledger.env
+sh deploy/install.sh                                  # user, program, systemd units, /etc/ledger/ledger.env
 cp /usr/local/share/ledger/postgresql-lowmem.conf /etc/postgresql/*/main/conf.d/ledger.conf
 systemctl restart postgresql
 sh /usr/local/share/ledger/setup-db.sh                # roles, schema, grants; writes DATABASE_URL
@@ -148,17 +152,21 @@ suffix (`v0.5.0-rc.1`) are published as pre-releases.
 ```
 api/openapi.yaml      API contract (frontend and backend both follow it)
 db/schema.sql         Tables, CHECK constraints, balance/immutability triggers
-backend/main.go       Config, DB pool, HTTP server, models matching the spec
-backend/ledger.go     Journal entry validation, transactional posting, reversal
-backend/accounts.go   Chart of accounts, account ledger, trial balance
-backend/export.go     General Ledger CSV export, CSV file listing/download
-backend/import.go     All-or-nothing CSV import of journal entries
-backend/upload.go     CSV upload (never overwrites)
-backend/auth.go       Users, bcrypt passwords, sessions, login rate limiting
-backend/reports.go    Balance sheet and income statement
-backend/cli.go        `ledger user add|passwd|disable|enable|list`
-backend/static.go     Serves the embedded frontend (backend/web) with SPA fallback
-backend/handlers.go   HTTP handlers, error mapping, request safety
+backend/src/main.ts       Startup, HTTP server, `ledger user` dispatch
+backend/src/types.ts      Models matching the spec
+backend/src/ledger.ts     Journal entry validation, transactional posting, reversal
+backend/src/accounts.ts   Chart of accounts, account ledger, trial balance
+backend/src/files.ts      General Ledger CSV export, file listing/download, uploads
+backend/src/import.ts     All-or-nothing CSV import of journal entries
+backend/src/auth.ts       Users, bcrypt passwords, sessions
+backend/src/reports.ts    Balance sheet and income statement
+backend/src/cli.ts        `ledger user add|passwd|disable|enable|list`
+backend/src/http.ts       Routes, handlers, error mapping, request safety
+backend/src/decode.ts     Strict JSON request decoding (exact integers, no unknown fields)
+backend/src/csv.ts        RFC 4180 CSV reader/writer
+backend/src/money.ts      Integer-cent parsing and formatting (bigint)
+backend/ledger.sh         Launcher installed as /usr/local/bin/ledger
+backend/test/             Unit tests and PostgreSQL integration tests (node:test)
 frontend/             SvelteKit app; API types generated from api/openapi.yaml
 deploy/               proxmox-deploy.sh, install.sh, setup-db.sh, systemd units, backups
 deploy/lxc-template/  LXC template builder and first-boot provisioning
@@ -168,15 +176,15 @@ docs/DEPLOYMENT.md    Proxmox LXC + TrueNAS deployment guide
 
 ## Accounting rules and where they are enforced
 
-| Rule | Go | PostgreSQL |
-|------|----|------------|
-| Entry has >= 2 lines | `ValidateJournalEntry` | deferred constraint trigger, checked at `COMMIT` |
+| Rule | Application | PostgreSQL |
+|------|-------------|------------|
+| Entry has >= 2 lines | `validateJournalEntry` | deferred constraint trigger, checked at `COMMIT` |
 | Debits = credits **per currency** | `checkLinesPostable` | deferred constraint trigger, checked at `COMMIT` |
 | Line currency = account currency | taken from the account | composite FK `(account_id, currency)` |
-| Only CAD / USD, 2 decimals | `Currency.Valid` | `currencies` table + `CHECK (minor_units = 2)` |
+| Only CAD / USD, 2 decimals | `isCurrency` | `currencies` table + `CHECK (minor_units = 2)` |
 | Account code/currency fixed | not editable via API | `BEFORE UPDATE` trigger |
-| No zero / both-sided lines | `ValidateJournalEntry` | `CHECK (amount <> 0)` |
-| Integer money only | `int64` cents; JSON floats rejected | `BIGINT` cents |
+| No zero / both-sided lines | `validateJournalEntry` | `CHECK (amount <> 0)` |
+| Integer money only | `bigint` cents; JSON floats rejected | `BIGINT` cents |
 | All-or-nothing posting | one `BEGIN … COMMIT` per entry | deferred triggers abort the `COMMIT` |
 | Posted rows immutable | no update/delete code paths | triggers reject `UPDATE`/`DELETE`/`TRUNCATE`; lines can't be added to an entry from a later transaction |
 | Corrections | `POST /journal-entries/{id}/reverse` | `UNIQUE (reverses_id)`: reversed once at most |
@@ -223,12 +231,14 @@ Optional columns: `reference`, `memo`, `currency`. Full rules are in
 For production, see [Installation](#installation). To run locally for
 development:
 
+Needs Node.js 22.18 or newer.
+
 ```sh
 createdb ledger && psql -d ledger -v ON_ERROR_STOP=1 -f db/schema.sql
-make build            # npm ci + vite build, then a static Go binary embedding it
+make build            # frontend (vite build) + backend bundle into out/
 export DATABASE_URL=postgres://localhost/ledger
-./bin/ledger user add alice
-CSV_DIR=./csv ./bin/ledger      # http://localhost:8080
+./out/bin/ledger user add alice
+CSV_DIR=./csv ./out/bin/ledger      # http://localhost:8080
 ```
 
 | Variable        | Default          |
@@ -238,6 +248,8 @@ CSV_DIR=./csv ./bin/ledger      # http://localhost:8080
 | `CSV_DIR`       | `/app/csv_data`  |
 | `DB_MAX_CONNS`  | `4`              |
 | `COOKIE_SECURE` | `auto`           |
+| `WEB_DIR`       | `web` next to `ledger.mjs` |
+| `LEDGER_MAX_HEAP_MB` | `96` (JavaScript heap limit, set by the launcher) |
 
 ### Authentication
 
@@ -256,9 +268,9 @@ income that hasn't been closed to equity appears on the balance sheet as
 ### Frontend development
 
 ```sh
-./bin/ledger &                 # API on :8080
-cd frontend && npm run dev     # Vite on :5173, proxies /api to :8080
-make api-types                 # after editing api/openapi.yaml
+(cd backend && npm ci && npm start) &   # API on :8080, straight from the TypeScript sources
+(cd frontend && npm run dev)            # Vite on :5173, proxies /api to :8080
+make api-types                          # after editing api/openapi.yaml
 ```
 
 The frontend only talks to the API through `openapi-fetch` with types
@@ -271,8 +283,8 @@ it can't drop or disable the triggers (`deploy/setup-db.sh`, `db/grants.sql`).
 ## Tests
 
 ```sh
-make test                                                       # Go + frontend checks/unit tests
-make test-integration TEST_DATABASE_URL=postgres://postgres@localhost/postgres
+make test                                                       # type checks + unit tests (backend and frontend)
+make test-integration TEST_DATABASE_URL=postgres://postgres:secret@localhost/postgres
 ```
 
 The integration tests create a throwaway database, apply `db/schema.sql`, test

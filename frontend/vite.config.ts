@@ -11,11 +11,11 @@ export default defineConfig({
 					filename.split(/[/\\]/).includes('node_modules') ? undefined : true
 			},
 
-			// Single-page app: nothing is prerendered; the Go server serves
+			// Single-page app: nothing is prerendered; the backend serves
 			// 200.html for every non-API path and the client router takes over.
 			adapter: adapter({ fallback: '200.html' }),
 
-			// Everything is served by the Go binary from the same origin.
+			// Everything is served by the backend from the same origin.
 			csp: {
 				mode: 'hash',
 				directives: {
@@ -32,7 +32,7 @@ export default defineConfig({
 		})
 	],
 	server: {
-		// `npm run dev`: forward API calls to a locally running Go server.
+		// `npm run dev`: forward API calls to a locally running backend.
 		proxy: { '/api': 'http://127.0.0.1:8080' }
 	}
 });

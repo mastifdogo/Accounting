@@ -1,7 +1,6 @@
-/bin/
-*.test
+/out/
+/dist/
+/backend/dist/
+node_modules/
 *.out
 .env
-/backend/web/*
-!/backend/web/.gitkeep
-/dist/

@@ -1,7 +1,7 @@
 -- =============================================================================
 -- Double-entry accounting ledger: PostgreSQL schema (PostgreSQL 13+)
 --
--- Invariants enforced IN THE DATABASE (the Go backend validates too, but the
+-- Invariants enforced IN THE DATABASE (the backend validates too, but the
 -- database is the final authority):
 --
 --   1. Every journal entry has at least two transaction lines.

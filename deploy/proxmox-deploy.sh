@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deploys Ledger into a new Proxmox LXC container, or upgrades an existing one.
 # Run on the Proxmox host as root, from an unpacked release (or a repo after
-# `make build`):
+# `make build runtime`):
 #
 #   ./deploy/proxmox-deploy.sh --csv-path /mnt/pve/truenas/ledger
 #   ./deploy/proxmox-deploy.sh --upgrade --ctid 120
@@ -200,19 +200,33 @@ if [ -n "$RELEASE" ]; then
 	[ -f "$RELEASE" ] || die "release file not found: $RELEASE"
 	release_tar=$RELEASE
 else
-	[ -x "$src_dir/bin/ledger" ] || die "no bin/ledger next to this script; run 'make build' or pass --release FILE"
+	# An unpacked release has bin/ and lib/ next to deploy/; a repository
+	# checkout has them in out/ after `make build runtime`.
+	if [ -x "$src_dir/bin/ledger" ] && [ -f "$src_dir/lib/ledger/ledger.mjs" ]; then
+		tree=$src_dir
+	elif [ -x "$src_dir/out/bin/ledger" ] && [ -f "$src_dir/out/lib/ledger/ledger.mjs" ]; then
+		tree=$src_dir/out
+	else
+		die "no Ledger build next to this script; run 'make build runtime' or pass --release FILE"
+	fi
+	[ -x "$tree/lib/ledger/node" ] || die "no Node.js runtime in $tree/lib/ledger; run 'make runtime' or pass --release FILE"
 	for f in db/schema.sql db/grants.sql deploy/install.sh deploy/setup-db.sh; do
 		[ -f "$src_dir/$f" ] || die "missing $src_dir/$f"
 	done
+	stage="$tmp_dir/ledger-release"
+	mkdir -p "$stage/db"
+	cp -R "$tree/bin" "$tree/lib" "$src_dir/deploy" "$stage/"
+	cp "$src_dir/db/schema.sql" "$src_dir/db/grants.sql" "$stage/db/"
 	release_tar="$tmp_dir/ledger-release.tar.gz"
-	tar -C "$src_dir" -czf "$release_tar" --transform 's,^\./,ledger-release/,' \
-		./bin/ledger ./db/schema.sql ./db/grants.sql ./deploy
+	tar -C "$tmp_dir" -czf "$release_tar" ledger-release
 fi
 
 # Read the listing once (piping tar into `grep -q` trips pipefail).
 listing=$(tar -tzf "$release_tar") || die "cannot read $release_tar"
 # Releases have one top-level directory (push_release strips it).
-grep -Eq '^[^/]+/bin/ledger$' <<<"$listing" || die "$release_tar does not look like a Ledger release (no <dir>/bin/ledger)"
+for f in bin/ledger lib/ledger/ledger.mjs lib/ledger/node deploy/install.sh; do
+	grep -Eq "^[^/]+/$f\$" <<<"$listing" || die "$release_tar does not look like a Ledger release (no <dir>/$f)"
+done
 
 # Architecture sanity check (release names end in linux-<arch>).
 host_arch=$(dpkg --print-architecture 2>/dev/null || uname -m)

@@ -25,7 +25,7 @@ usage() {
 	cat <<EOF
 Usage: $0 [options]
 
-  --release FILE   Ledger release tarball (default: this checkout's bin/ledger, db/ and deploy/)
+  --release FILE   Ledger release tarball (default: this checkout's out/ from 'make build runtime', db/ and deploy/)
   --suite NAME     bookworm (Debian 12, default), trixie (Debian 13), noble (Ubuntu 24.04), jammy (Ubuntu 22.04)
   --arch ARCH      amd64 (default) or arm64; must match the release binary
   --mirror URL     package mirror (default: deb.debian.org / archive.ubuntu.com)
@@ -85,13 +85,16 @@ if [ -n "$RELEASE" ]; then
 	fi
 	case "$RELEASE" in *linux-"$ARCH"*) ;; *linux-*) die "release architecture does not match --arch $ARCH" ;; esac
 else
-	[ -x "$repo/bin/ledger" ] || die "no $repo/bin/ledger: run 'make build' or pass --release FILE"
-	mkdir -p "$stage/bin" "$stage/db"
-	cp "$repo/bin/ledger" "$stage/bin/"
+	[ -x "$repo/out/bin/ledger" ] && [ -x "$repo/out/lib/ledger/node" ] ||
+		die "no $repo/out with a Node.js runtime: run 'make build runtime' or pass --release FILE"
+	mkdir -p "$stage/db"
+	cp -R "$repo/out/bin" "$repo/out/lib" "$stage/"
 	cp "$repo/db/schema.sql" "$repo/db/grants.sql" "$stage/db/"
 	cp -R "$repo/deploy" "$stage/deploy"
 fi
-[ -x "$stage/bin/ledger" ] && [ -f "$stage/deploy/install.sh" ] || die "the release is missing bin/ledger or deploy/install.sh"
+for f in bin/ledger lib/ledger/ledger.mjs lib/ledger/node deploy/install.sh; do
+	[ -e "$stage/$f" ] || die "the release is missing $f"
+done
 VERSION=${VERSION:-$(git -C "$repo" describe --tags --always --dirty 2>/dev/null || echo dev)}
 for f in ledger-firstboot.sh ledger-firstboot.service ledger-after-firstboot.conf; do
 	[ -f "$here/$f" ] || die "missing $here/$f"

@@ -2,7 +2,7 @@ import { redirect } from '@sveltejs/kit';
 import { api } from '#lib/api/client.ts';
 import type { LayoutLoad } from './$types';
 
-// Single-page app served by the Go backend: render in the browser only.
+// Single-page app served by the backend: render in the browser only.
 export const ssr = false;
 export const prerender = false;
 
