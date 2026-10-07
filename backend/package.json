@@ -1,0 +1,26 @@
+{
+	"name": "ledger-backend",
+	"private": true,
+	"version": "0.5.0",
+	"type": "module",
+	"engines": {
+		"node": ">=22.18"
+	},
+	"scripts": {
+		"build": "node build.mjs",
+		"start": "node src/main.ts",
+		"check": "tsc --noEmit",
+		"test": "node --test test/unit.test.ts",
+		"test:integration": "node --test --test-concurrency=1 test/integration.test.ts"
+	},
+	"dependencies": {
+		"bcryptjs": "^3.0.3",
+		"pg": "^8.23.1"
+	},
+	"devDependencies": {
+		"@types/node": "^22.20.5",
+		"@types/pg": "^8.23.1",
+		"esbuild": "^0.28.2",
+		"typescript": "^6.0.3"
+	}
+}

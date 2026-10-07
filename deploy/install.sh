@@ -1,9 +1,11 @@
 #!/bin/sh
 # Installs (or upgrades) Ledger from an unpacked release directory:
 #   sudo sh deploy/install.sh
-# Creates the `ledger` system user, installs the binary, SQL files, helper
-# scripts and systemd units, and creates /etc/ledger/ledger.env on first
-# install. Existing configuration is never overwritten.
+# Creates the `ledger` system user, installs the program (launcher in
+# /usr/local/bin/ledger; server, web UI and Node.js runtime in
+# /usr/local/lib/ledger), SQL files, helper scripts and systemd units, and
+# creates /etc/ledger/ledger.env on first install. Existing configuration is
+# never overwritten.
 #
 # Environment: LEDGER_UID (default 990) — fixed so the TrueNAS bind mount
 # ownership can be mapped predictably (host uid = 100000 + LEDGER_UID for an
@@ -15,7 +17,16 @@ src=$(cd "$(dirname "$0")/.." && pwd)
 LEDGER_UID="${LEDGER_UID:-990}"
 CSV_DIR="${CSV_DIR:-/app/csv_data}"
 
-[ -x "$src/bin/ledger" ] || { echo "$src/bin/ledger not found; run 'make build' or unpack a release" >&2; exit 1; }
+[ -x "$src/bin/ledger" ] && [ -f "$src/lib/ledger/ledger.mjs" ] ||
+	{ echo "$src/bin/ledger or $src/lib/ledger/ledger.mjs not found; run 'make build' or unpack a release" >&2; exit 1; }
+if [ ! -x "$src/lib/ledger/node" ]; then
+	# A `make build` tree has no bundled runtime: the system's node must do.
+	major=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)
+	if [ "$major" -lt 22 ]; then
+		echo "no Node.js runtime in $src/lib/ledger and no system node >= 22; use a release tarball (make release)" >&2
+		exit 1
+	fi
+fi
 
 echo "==> user"
 if ! id ledger >/dev/null 2>&1; then
@@ -26,6 +37,15 @@ fi
 echo "    ledger uid=$(id -u ledger) gid=$(id -g ledger)"
 
 echo "==> files"
+# Replace the program directory as a whole, so files from an older release
+# never linger. The running service keeps its open files until restarted.
+rm -rf /usr/local/lib/ledger.new /usr/local/lib/ledger.old
+cp -R "$src/lib/ledger" /usr/local/lib/ledger.new
+chown -R root:root /usr/local/lib/ledger.new
+chmod -R u=rwX,go=rX /usr/local/lib/ledger.new
+[ ! -e /usr/local/lib/ledger ] || mv /usr/local/lib/ledger /usr/local/lib/ledger.old
+mv /usr/local/lib/ledger.new /usr/local/lib/ledger
+rm -rf /usr/local/lib/ledger.old
 install -m 0755 "$src/bin/ledger" /usr/local/bin/ledger
 install -m 0755 "$src/deploy/ledger-backup.sh" /usr/local/bin/ledger-backup
 install -m 0755 "$src/deploy/ledger-user.sh" /usr/local/sbin/ledger-user
